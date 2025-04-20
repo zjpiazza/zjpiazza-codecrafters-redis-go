@@ -11,13 +11,14 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Ensures gofmt doesn't remove the "net" and "os" imports in stage 1 (feel free to remove this!)
 var _ = net.Listen
 var _ = os.Exit
 
-var db map[string]interface{}
+var db = make(map[string]KeystoreEntry)
 
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -57,14 +58,14 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
-func loadDatabase() map[string]interface{} {
+func loadDatabase() map[string]KeystoreEntry {
 	if _, err := os.Stat("db.json"); errors.Is(err, os.ErrNotExist) {
-		return make(map[string]interface{})
+		return make(map[string]KeystoreEntry)
 	} else {
 		db, err := readMapFromJSON("db.json")
 		if err != nil {
 			fmt.Println("Error loading database:", err)
-			return make(map[string]interface{})
+			return make(map[string]KeystoreEntry)
 		}
 		return db
 	}
@@ -178,6 +179,10 @@ func parseArrayHeader(line string) (int, bool) {
 	return count, true
 }
 
+type KeystoreEntry struct {
+	value, expiry interface{}
+}
+
 func executeCommand(command string, args []string, conn net.Conn) {
 	switch command {
 	case "PING":
@@ -197,7 +202,22 @@ func executeCommand(command string, args []string, conn net.Conn) {
 		}
 		key := args[0]
 		value := args[1]
-		db[key] = value
+
+		var expiry time.Time
+
+		// Does key have expiry?
+
+		if len(args) > 2 && strings.ToLower(args[2]) == "px" {
+			expMilli, err := strconv.Atoi(args[3])
+			if err != nil {
+				sendError(errors.New("Expiration time is not a valid integer"), conn)
+			}
+			currentTime := time.Now()
+			expiry = currentTime.Add(time.Duration(expMilli) * time.Millisecond)
+			db[key] = KeystoreEntry{value, expiry}
+		} else {
+			db[key] = KeystoreEntry{value, ""}
+		}
 
 		// Check for optional arguments (EX, PX, etc.)
 		// Not implemented in this basic version
@@ -213,18 +233,28 @@ func executeCommand(command string, args []string, conn net.Conn) {
 			return
 		}
 		key := args[0]
-		value, exists := db[key]
-		if !exists || value == nil {
+		entry, exists := db[key]
+		if !exists || entry.value == nil {
 			// Return Redis null bulk string for non-existent keys
 			conn.Write([]byte("$-1\r\n"))
 			return
 		}
 
 		// Safe type assertion
-		strValue, ok := value.(string)
+		strValue, ok := entry.value.(string)
 		if !ok {
 			conn.Write([]byte("$-1\r\n"))
 			return
+		}
+
+		// Access and type assert the expiry
+		expiryTime, ok := entry.expiry.(time.Time)
+		if ok { // Only check expiry if it's actually a time.Time
+			// Check if key is expired
+			if time.Now().After(expiryTime) {
+				conn.Write([]byte("$-1\r\n"))
+				return // Key is expired
+			}
 		}
 
 		conn.Write([]byte(formatBulkString(strValue)))
@@ -233,7 +263,7 @@ func executeCommand(command string, args []string, conn net.Conn) {
 	}
 }
 
-func writeMapToJSON(data map[string]interface{}, filename string) error {
+func writeMapToJSON(data map[string]KeystoreEntry, filename string) error {
 	// Marshal the map to JSON
 	jsonData, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
@@ -244,7 +274,7 @@ func writeMapToJSON(data map[string]interface{}, filename string) error {
 	return os.WriteFile(filename, jsonData, 0644)
 }
 
-func readMapFromJSON(filename string) (map[string]interface{}, error) {
+func readMapFromJSON(filename string) (map[string]KeystoreEntry, error) {
 	// Read file
 	jsonData, err := os.ReadFile(filename)
 	if err != nil {
@@ -252,7 +282,7 @@ func readMapFromJSON(filename string) (map[string]interface{}, error) {
 	}
 
 	// Unmarshal JSON to map
-	var result map[string]interface{}
+	var result map[string]KeystoreEntry
 	err = json.Unmarshal(jsonData, &result)
 	if err != nil {
 		return nil, err
