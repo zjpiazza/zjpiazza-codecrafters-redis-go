@@ -30,9 +30,45 @@ func main() {
 			os.Exit(1)
 		}
 
-		reader := bufio.NewReader(conn)
+		go handleConnection(conn)
+
+	}
+}
+
+func handleConnection(conn net.Conn) {
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+
+	for {
+		// Read the first line which should be "*1\r\n" for PING
+		_, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Println("Error reading command:", err)
+			return
+		}
+
+		// Read the second line which should be "$4\r\n" for PING
+		_, err = reader.ReadString('\n')
+		if err != nil {
+			fmt.Println("Error reading command:", err)
+			return
+		}
+
+		// Read the third line which should be "PING\r\n"
 		command, err := reader.ReadString('\n')
-		go handleCommand(command, conn)
+		if err != nil {
+			fmt.Println("Error reading command:", err)
+			return
+		}
+
+		// At this point we've read the entire PING command
+		fmt.Println("Received command:", command)
+
+		// Respond with PONG
+		conn.Write([]byte("+PONG\r\n"))
+
+		// Continue the loop to handle more commands on this connection
 	}
 }
 
