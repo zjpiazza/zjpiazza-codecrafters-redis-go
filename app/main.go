@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"reflect"
+	"strconv"
+	"strings"
 )
 
 // Ensures gofmt doesn't remove the "net" and "os" imports in stage 1 (feel free to remove this!)
@@ -38,43 +41,62 @@ func main() {
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	reader := bufio.NewReader(conn)
-
 	for {
-		// Read the first line which should be "*1\r\n" for PING
-		_, err := reader.ReadString('\n')
-		if err != nil {
-			fmt.Println("Error reading command:", err)
-			return
-		}
-
-		// Read the second line which should be "$4\r\n" for PING
-		_, err = reader.ReadString('\n')
-		if err != nil {
-			fmt.Println("Error reading command:", err)
-			return
-		}
-
-		// Read the third line which should be "PING\r\n"
-		command, err := reader.ReadString('\n')
-		if err != nil {
-			fmt.Println("Error reading command:", err)
-			return
-		}
-
-		// At this point we've read the entire PING command
-		fmt.Println("Received command:", command)
-
-		// Respond with PONG
-		conn.Write([]byte("+PONG\r\n"))
-
-		// Continue the loop to handle more commands on this connection
+		go handleCommand(conn)
 	}
 }
 
-func handleCommand(command string, conn net.Conn) {
+func handleCommand(conn net.Conn) {
+	reader := bufio.NewReader(conn)
+
+	// Read the first line which should be "*1\r\n" for PING
+	_, err := reader.ReadString('\n')
+	if err != nil {
+		fmt.Println("Error reading command:", err)
+		return
+	}
+
+	// Read the second line which should be "$4\r\n" for PING
+	_, err = reader.ReadString('\n')
+	if err != nil {
+		fmt.Println("Error reading command:", err)
+		return
+	}
+
+	// Read the third line which should be "PING\r\n"
+	command, err := reader.ReadString('\n')
+	command = strings.TrimSuffix(command, "\r\n")
+	if err != nil {
+		fmt.Println("Error reading command:", err)
+		return
+	}
+
 	switch command {
-	default:
+	case "PING":
+		// Respond with RESP simple string
 		conn.Write([]byte("+PONG\r\n"))
+	case "ECHO":
+		// Respond with RESP bulk string
+		// Read the next line to grab the data
+		length, _ := reader.ReadString('\n')
+		length = strings.TrimSuffix(length, "\r\n")
+		length = strings.TrimPrefix(length, "$")
+		lengthParsed, _ := strconv.Atoi(length)
+
+		data, _ := reader.ReadString('\n')
+		data = strings.TrimSuffix(data, "\r\n")
+
+		fmt.Println(length)
+		fmt.Println(data)
+
+		response := fmt.Sprintf("$%d\r\n%s\r\n", lengthParsed, data)
+		fmt.Println(response)
+
+		conn.Write([]byte(response))
+	default:
+		fmt.Printf("Fall through statement on command: %s", command)
+		fmt.Print("ECHO" == command)
+		fmt.Println(reflect.TypeOf("ECHO"))
+		fmt.Println(reflect.TypeOf(command))
 	}
 }
