@@ -2,7 +2,8 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -12,17 +13,17 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 )
 
-// Ensures gofmt doesn't remove the "net" and "os" imports in stage 1 (feel free to remove this!)
+// Ensures gofmt doesn't remove the "net" and "os" imports in stage 1
 var _ = net.Listen
 var _ = os.Exit
 
-// db and config are now global for simplicity in this example,
-// but consider passing them to functions in a larger application.
-var db = make(map[string]KeystoreEntry)
+// config is kept global for simplicity
 var config = make(map[string]string)
+
+// currentDB keeps track of the current database number
+var currentDB int
 
 const OKResp string = "+OK\r\n"
 const NullResp string = "$-1\r\n"
@@ -35,7 +36,17 @@ const (
 	opCodeExpireTimeMs byte = 252 /* Expire time in milliseconds. */
 	opCodeExpireTime   byte = 253 /* Old expire time in seconds. */
 	opCodeSelectDB     byte = 254 /* DB number of the following keys. */
-	opCodeEOF          byte = 255
+	opCodeEOF          byte = 255 /* End of RDB file indicator. */
+)
+
+// Value type opcodes
+const (
+	ValueTypeString byte = 0x00
+	ValueTypeList   byte = 0x01
+	ValueTypeSet    byte = 0x02
+	ValueTypeZSet   byte = 0x03
+	ValueTypeHash   byte = 0x04
+	// Add other value types as needed
 )
 
 // Read arguments
@@ -43,42 +54,19 @@ var directory string
 var dbFilename string
 
 func main() {
-	fmt.Println("Logs from your program will appear here!")
+	fmt.Println("Starting Redis server with RDB file support")
 
-	flag.StringVar(&directory, "dir", "", "Directory for files")                           // directory flag is not used in this updated code
-	flag.StringVar(&dbFilename, "dbfilename", "db.json", "Filename for the database file") // Default to db.json
+	flag.StringVar(&directory, "dir", "", "Directory for files")
+	flag.StringVar(&dbFilename, "dbfilename", "dump.rdb", "Filename for the RDB database file") // Default to dump.rdb
 	flag.Parse()
 
-	configFilename := "config.json" // Assuming a fixed config filename for now
-
-	// Create file readers/writers
-	dbReader := &JSONFileReader{filename: dbFilename}
-	dbWriter := &JSONFileWriter{filename: dbFilename}
-	configReader := &JSONFileReader{filename: configFilename}
-
-	// Load db and config using the interfaces
-	var loadDBErr error
-	db, loadDBErr = loadDatabase(dbReader)
-	if loadDBErr != nil {
-		fmt.Printf("Error loading database from %s: %v. Starting with an empty database.\n", dbFilename, loadDBErr)
-		db = make(map[string]KeystoreEntry) // Initialize with an empty map on error
-	} else {
-		fmt.Printf("Database loaded successfully from %s.\n", dbFilename)
+	// Basic config initialization
+	config = make(map[string]string)
+	if directory != "" {
+		config["dir"] = directory
 	}
-
-	var loadConfigErr error
-	config, loadConfigErr = loadConfig(configReader)
-	if loadConfigErr != nil {
-		fmt.Printf("Error loading config from %s: %v. Starting with empty config.\n", configFilename, loadConfigErr)
-		config = make(map[string]string) // Initialize with an empty map on error
-		if directory != "" {
-			config["dir"] = directory
-		}
-		if dbFilename != "" {
-			config["dbfilename"] = dbFilename
-		}
-	} else {
-		fmt.Printf("Config loaded successfully from %s.\n", configFilename)
+	if dbFilename != "" {
+		config["dbfilename"] = dbFilename
 	}
 
 	l, err := net.Listen("tcp", "0.0.0.0:6379")
@@ -94,11 +82,11 @@ func main() {
 			os.Exit(1)
 		}
 
-		go handleConnection(conn, dbWriter) // Pass the writer to handlers that might save
+		go handleConnection(conn)
 	}
 }
 
-func handleConnection(conn net.Conn, dbWriter JSONWriter) {
+func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	reader := bufio.NewReader(conn)
@@ -115,158 +103,8 @@ func handleConnection(conn net.Conn, dbWriter JSONWriter) {
 			sendError(err, conn)
 			return // Terminate the connection on parsing errors
 		}
-		executeCommand(command, args, conn, dbWriter) // Pass the writer
+		executeCommand(command, args, conn)
 	}
-}
-
-// JSONReader defines the interface for reading data into a map from a source.
-type JSONReader interface {
-	Read(target map[string]interface{}) error
-}
-
-// JSONWriter defines the interface for writing data from a map to a destination.
-type JSONWriter interface {
-	Write(data map[string]interface{}) error
-}
-
-// JSONFileReader implements JSONReader for file reading.
-type JSONFileReader struct {
-	filename string
-}
-
-func (r *JSONFileReader) Read(target map[string]interface{}) error {
-	// Read file
-	jsonData, err := os.ReadFile(r.filename)
-	if err != nil {
-		return err // Return the original error, including os.ErrNotExist
-	}
-
-	// If the file is empty, return an empty map without unmarshalling
-	if len(jsonData) == 0 {
-		for k := range target { // Clear existing map if target was not empty
-			delete(target, k)
-		}
-		return nil
-	}
-
-	// Unmarshal JSON to map
-	return json.Unmarshal(jsonData, &target)
-}
-
-// JSONFileWriter implements JSONWriter for file writing.
-type JSONFileWriter struct {
-	filename string
-}
-
-func (w *JSONFileWriter) Write(data map[string]interface{}) error {
-	// Marshal the map to JSON
-	jsonData, err := json.MarshalIndent(data, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	// Write JSON to file
-	// Use a temporary file and rename to ensure atomicity for writes
-	tmpFilename := w.filename + ".tmp"
-	err = os.WriteFile(tmpFilename, jsonData, 0644)
-	if err != nil {
-		return err
-	}
-
-	// Rename the temporary file to the final filename
-	err = os.Rename(tmpFilename, w.filename)
-	if err != nil {
-		// Clean up the temporary file if renaming fails
-		os.Remove(tmpFilename)
-		return err
-	}
-
-	return nil
-}
-
-func loadDatabase(reader JSONReader) (map[string]KeystoreEntry, error) {
-	// Use map[string]interface{} for reading as json.Unmarshal populates this.
-	genericDB := make(map[string]interface{})
-	err := reader.Read(genericDB)
-	if err != nil {
-		// Return the error for the caller to handle (e.g., os.ErrNotExist)
-		return nil, err
-	}
-
-	// Convert the loaded map[string]interface{} to map[string]KeystoreEntry
-	convertedDB := make(map[string]KeystoreEntry)
-	for key, value := range genericDB {
-		entryMap, ok := value.(map[string]interface{})
-		if !ok {
-			fmt.Printf("Warning: Database entry for key '%s' is not an expected map format. Skipping.\n", key)
-			continue
-		}
-
-		var keystoreEntry KeystoreEntry
-		// Assuming 'value' and 'expiry' are fields in the JSON object
-		if val, valOk := entryMap["value"]; valOk {
-			keystoreEntry.value = val // Store the value as interface{}
-		}
-
-		if exp, expOk := entryMap["expiry"]; expOk {
-			// Assuming expiry is stored as a string formatted with time.RFC3339
-			expStr, isString := exp.(string)
-			if isString {
-				parsedTime, parseErr := time.Parse(time.RFC3339, expStr)
-				if parseErr == nil {
-					keystoreEntry.expiry = parsedTime
-				} else {
-					fmt.Printf("Warning: Failed to parse expiry for key '%s': %v. Treating as no expiry.\n", key, parseErr)
-				}
-			} else if exp != nil { // Handle cases where 'expiry' might be explicitly null in JSON
-				fmt.Printf("Warning: Expiry for key '%s' is not a string. Treating as no expiry.\n", key)
-			}
-		}
-		convertedDB[key] = keystoreEntry
-	}
-
-	return convertedDB, nil
-}
-
-func saveDatabase(writer JSONWriter, db map[string]KeystoreEntry) error {
-	// Convert the map[string]KeystoreEntry to map[string]interface{} for writing
-	dataToSave := make(map[string]interface{})
-	for key, entry := range db {
-		entryMap := make(map[string]interface{})
-		entryMap["value"] = entry.value // Store the value
-
-		// Handle saving expiry time
-		if expiryTime, ok := entry.expiry.(time.Time); ok {
-			entryMap["expiry"] = expiryTime.Format(time.RFC3339) // Save as RFC3339 formatted string
-		} else {
-			entryMap["expiry"] = nil // Save as null if no expiry
-		}
-		dataToSave[key] = entryMap
-	}
-	return writer.Write(dataToSave)
-}
-
-func loadConfig(reader JSONReader) (map[string]string, error) {
-	// Use map[string]interface{} for reading as json.Unmarshal populates this.
-	genericConfig := make(map[string]interface{})
-	err := reader.Read(genericConfig)
-	if err != nil {
-		// Return the error for the caller to handle (e.g., os.ErrNotExist)
-		return nil, err
-	}
-
-	// Convert the loaded map[string]interface{} to map[string]string
-	convertedConf := make(map[string]string)
-	for key, value := range genericConfig {
-		strValue, ok := value.(string)
-		if !ok {
-			// Log a warning but continue processing other config entries
-			fmt.Printf("Warning: Config value for key '%s' is not a string. Skipping.\n", key)
-			continue
-		}
-		convertedConf[key] = strValue
-	}
-	return convertedConf, nil
 }
 
 func sendError(err error, conn net.Conn) {
@@ -295,7 +133,7 @@ func parseCommand(reader *bufio.Reader, conn net.Conn) (string, []string, error)
 	var arguments []string
 
 	for i := 0; i < count; i++ {
-		element, err := parseBulkString(reader) // parseBulkString no longer needs the connection
+		element, err := parseBulkString(reader)
 		if err != nil {
 			return "", nil, err
 		}
@@ -388,17 +226,229 @@ func parseArrayHeader(line string) (int, bool) {
 	return count, true
 }
 
-type KeystoreEntry struct {
-	value  interface{} // Using interface{} to store any type of value
-	expiry interface{} // Using interface{} to store time.Time or nil
+// readLength reads a length-encoded integer from the byte slice.
+// It returns the decoded length and the number of bytes consumed.
+func readLength(data []byte, offset int) (int, int, error) {
+	if offset >= len(data) {
+		return 0, 0, io.EOF
+	}
+
+	firstByte := data[offset]
+
+	// Check the two most significant bits
+	switch (firstByte & 0xC0) >> 6 {
+	case 0: // 00 prefix - 6 bit length
+		return int(firstByte & 0x3F), 1, nil
+
+	case 1: // 01 prefix - 14 bit length
+		if offset+1 >= len(data) {
+			return 0, 0, io.ErrUnexpectedEOF
+		}
+		length := (int(firstByte&0x3F) << 8) | int(data[offset+1])
+		return length, 2, nil
+
+	case 2: // 10 prefix - 32 bit length
+		if offset+4 >= len(data) {
+			return 0, 0, io.ErrUnexpectedEOF
+		}
+		length := binary.BigEndian.Uint32(data[offset+1 : offset+5])
+		return int(length), 5, nil
+
+	case 3: // 11 prefix - Special format
+		// Here we handle special encodings (like integers)
+		specialFormat := firstByte & 0x3F
+
+		// Handle integer encodings
+		switch specialFormat {
+		case 0: // 8 bit integer
+			if offset+1 >= len(data) {
+				return 0, 0, io.ErrUnexpectedEOF
+			}
+			return int(data[offset+1]), 2, nil
+
+		case 1: // 16 bit integer
+			if offset+2 >= len(data) {
+				return 0, 0, io.ErrUnexpectedEOF
+			}
+			value := binary.LittleEndian.Uint16(data[offset+1 : offset+3])
+			return int(value), 3, nil
+
+		case 2: // 32 bit integer
+			if offset+4 >= len(data) {
+				return 0, 0, io.ErrUnexpectedEOF
+			}
+			value := binary.LittleEndian.Uint32(data[offset+1 : offset+5])
+			return int(value), 5, nil
+
+		default:
+			return 0, 0, fmt.Errorf("unsupported special encoding format %d", specialFormat)
+		}
+	}
+
+	return 0, 0, fmt.Errorf("invalid length encoding byte: %x", firstByte)
 }
 
-func executeCommand(command string, args []string, conn net.Conn, dbWriter JSONWriter) {
+// readString reads a length-encoded string from the byte slice
+func readString(data []byte, offset int) (string, int, error) {
+	if offset >= len(data) {
+		return "", 0, io.EOF
+	}
+
+	length, lengthBytes, err := readLength(data, offset)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to read string length at offset %d: %w", offset, err)
+	}
+
+	stringOffset := offset + lengthBytes
+	if stringOffset+length > len(data) {
+		return "", 0, io.ErrUnexpectedEOF
+	}
+
+	str := string(data[stringOffset : stringOffset+length])
+	return str, lengthBytes + length, nil
+}
+
+// Get value for a specific key from an RDB file
+// Returns the value as a byte slice and a boolean indicating if the key was found
+func readKeyValuePair(rdbData []byte, targetKey string) ([]byte, bool, error) {
+	offset := 0
+
+	// Skip header (REDIS and version)
+	// Magic string "REDIS" (5 bytes) + Version (4 bytes) = 9 bytes
+	if len(rdbData) < 9 {
+		return nil, false, fmt.Errorf("file too short to contain RDB header")
+	}
+
+	// Basic validation: Check for "REDIS" magic string
+	if !bytes.Equal(rdbData[offset:offset+5], []byte("REDIS")) {
+		return nil, false, fmt.Errorf("invalid RDB magic string")
+	}
+	offset += 9 // Skip header
+
+	for offset < len(rdbData) {
+		if offset >= len(rdbData) {
+			return nil, false, fmt.Errorf("unexpected end of file at offset %d", offset)
+		}
+
+		opcode := rdbData[offset]
+		offset++
+
+		switch opcode {
+		case opCodeAux:
+			// Skip auxiliary key
+			keyLen, keyBytes, err := readLength(rdbData, offset)
+			if err != nil {
+				return nil, false, fmt.Errorf("failed to read auxiliary key length at offset %d: %w", offset, err)
+			}
+			offset += keyBytes + keyLen
+
+			// Skip auxiliary value
+			valueLen, valueBytes, err := readLength(rdbData, offset)
+			if err != nil {
+				return nil, false, fmt.Errorf("failed to read auxiliary value length at offset %d: %w", offset, err)
+			}
+			offset += valueBytes + valueLen
+
+		case opCodeSelectDB:
+			// Read database number
+			dbNum, dbNumBytes, err := readLength(rdbData, offset)
+			if err != nil {
+				return nil, false, fmt.Errorf("failed to read database number at offset %d: %w", offset, err)
+			}
+			offset += dbNumBytes
+			currentDB = dbNum
+
+		case opCodeResizeDB:
+			// Skip database size info
+			_, hashTableBytes, err := readLength(rdbData, offset)
+			if err != nil {
+				return nil, false, fmt.Errorf("failed to read hash table size at offset %d: %w", offset, err)
+			}
+			offset += hashTableBytes
+
+			_, expiryHashTableBytes, err := readLength(rdbData, offset)
+			if err != nil {
+				return nil, false, fmt.Errorf("failed to read expiry hash table size at offset %d: %w", offset, err)
+			}
+			offset += expiryHashTableBytes
+
+		case opCodeExpireTime:
+			// Skip expiry time (4 bytes)
+			offset += 4
+			// Continue to value type
+
+		case opCodeExpireTimeMs:
+			// Skip expiry time (8 bytes)
+			offset += 8
+			// Continue to value type
+
+		case opCodeEOF:
+			// End of file
+			return nil, false, nil
+
+		default:
+			// This should be a value type
+			valueType := opcode
+
+			// Read key
+			keyLen, keyLenBytes, err := readLength(rdbData, offset)
+			if err != nil {
+				return nil, false, fmt.Errorf("failed to read key length at offset %d: %w", offset, err)
+			}
+			offset += keyLenBytes
+
+			if offset+keyLen > len(rdbData) {
+				return nil, false, fmt.Errorf("key extends beyond end of file at offset %d", offset)
+			}
+
+			key := string(rdbData[offset : offset+keyLen])
+			offset += keyLen
+
+			// Check if this is our target key
+			if key == targetKey {
+				// Found our target key, now read the value
+				if valueType == ValueTypeString {
+					valueLen, valueLenBytes, err := readLength(rdbData, offset)
+					if err != nil {
+						return nil, false, fmt.Errorf("failed to read value length at offset %d: %w", offset, err)
+					}
+					offset += valueLenBytes
+
+					if offset+valueLen > len(rdbData) {
+						return nil, false, fmt.Errorf("value extends beyond end of file at offset %d", offset)
+					}
+
+					value := rdbData[offset : offset+valueLen]
+					return value, true, nil
+				} else {
+					return nil, false, fmt.Errorf("unsupported value type %d for key %s", valueType, key)
+				}
+			} else {
+				// Not our target key, skip the value
+				if valueType == ValueTypeString {
+					valueLen, valueLenBytes, err := readLength(rdbData, offset)
+					if err != nil {
+						return nil, false, fmt.Errorf("failed to read value length at offset %d: %w", offset, err)
+					}
+					offset += valueLenBytes + valueLen
+				} else {
+					// For now, we don't handle other value types
+					return nil, false, fmt.Errorf("unsupported value type %d for key %s", valueType, key)
+				}
+			}
+		}
+	}
+
+	return nil, false, fmt.Errorf("key %s not found in RDB file", targetKey)
+}
+
+func executeCommand(command string, args []string, conn net.Conn) {
 	fmt.Printf("Command: %s\n", command)
 
 	switch command {
 	case "PING":
 		conn.Write([]byte("+PONG\r\n"))
+
 	case "ECHO":
 		if len(args) < 1 {
 			sendError(errors.New("wrong number of arguments for 'echo' command"), conn)
@@ -406,112 +456,46 @@ func executeCommand(command string, args []string, conn net.Conn, dbWriter JSONW
 		}
 		data := args[0]
 		conn.Write([]byte(formatBulkString(data)))
+
 	case "SET":
-		if len(args) < 2 {
-			sendError(errors.New("wrong number of arguments for 'set' command"), conn)
-			return
-		}
-		key := args[0]
-		value := args[1]
-
-		var expiry interface{} // Use interface{}
-
-		// Check for optional arguments (PX)
-		if len(args) > 2 && strings.ToLower(args[2]) == "nx" {
-			// SET with NX option: set the key only if it does not already exist.
-			_, exists := db[key]
-			if exists {
-				// According to Redis SET NX behavior, return null bulk string if key exists.
-				conn.Write([]byte("$-1\r\n"))
-				return
-			}
-			// Continue with setting the key if not exists.
-			if len(args) > 4 && strings.ToLower(args[3]) == "px" {
-				// Handle PX after NX
-				expMilli, err := strconv.Atoi(args[4])
-				if err != nil {
-					sendError(errors.New("expiration time is not a valid integer for PX option"), conn)
-					return
-				}
-				expiry = time.Now().Add(time.Duration(expMilli) * time.Millisecond)
-			}
-
-		} else if len(args) > 2 && strings.ToLower(args[2]) == "xx" {
-			// SET with XX option: set the key only if it already exists.
-			_, exists := db[key]
-			if !exists {
-				// According to Redis SET XX behavior, return null bulk string if key does not exist.
-				conn.Write([]byte("$-1\r\n"))
-				return
-			}
-			// Continue with setting the key if it exists.
-			if len(args) > 4 && strings.ToLower(args[3]) == "px" {
-				// Handle PX after XX
-				expMilli, err := strconv.Atoi(args[4])
-				if err != nil {
-					sendError(errors.New("expiration time is not a valid integer for PX option"), conn)
-					return
-				}
-				expiry = time.Now().Add(time.Duration(expMilli) * time.Millisecond)
-			}
-
-		} else if len(args) > 2 && strings.ToLower(args[2]) == "px" {
-			// SET with PX option
-			if len(args) < 4 {
-				sendError(errors.New("PX option requires an expiration time"), conn)
-				return
-			}
-			expMilli, err := strconv.Atoi(args[3])
-			if err != nil {
-				sendError(errors.New("expiration time is not a valid integer for PX option"), conn)
-				return
-			}
-			expiry = time.Now().Add(time.Duration(expMilli) * time.Millisecond)
-		}
-
-		db[key] = KeystoreEntry{value, expiry}
-
-		// Save the database after a successful SET
-		err := saveDatabase(dbWriter, db)
-		if err != nil {
-			fmt.Println("Error writing to database:", err)
-			// Consider sending an error back to the client here as well
-		}
-		conn.Write([]byte("+OK\r\n"))
+		sendError(errors.New("SET command not implemented for RDB mode"), conn)
+		return
 
 	case "GET":
 		if len(args) < 1 {
 			sendError(errors.New("wrong number of arguments for 'get' command"), conn)
 			return
 		}
+
+		// Form the full path to the RDB file
+		rdbPath := dbFilename
+		if directory != "" {
+			rdbPath = fmt.Sprintf("%s/%s", directory, dbFilename)
+		}
+
+		// Read the RDB file
+		rdbData, err := os.ReadFile(rdbPath)
+		if err != nil {
+			sendError(fmt.Errorf("failed to read RDB file: %w", err), conn)
+			return
+		}
+
+		// Get the key from RDB
 		key := args[0]
-		entry, exists := db[key]
-
-		if !exists {
-			conn.Write([]byte("$-1\r\n")) // Return Redis null bulk string for non-existent keys
+		value, found, err := readKeyValuePair(rdbData, key)
+		if err != nil {
+			fmt.Printf("Error finding key '%s': %v\n", key, err)
+			conn.Write([]byte(NullResp)) // Return null for errors
 			return
 		}
 
-		// Check for expiry if it exists and is a time.Time
-		if expiryTime, ok := entry.expiry.(time.Time); ok {
-			if time.Now().After(expiryTime) {
-				delete(db, key) // Remove the expired key
-				// Optionally, save the database here or rely on periodic saves
-				conn.Write([]byte("$-1\r\n")) // Return null bulk string for expired keys
-				return
-			}
-		}
-
-		// Safely get the value as a string
-		strValue, ok := entry.value.(string)
-		if !ok {
-			// Handle cases where the stored value is not a string (shouldn't happen with current SET)
-			fmt.Printf("Warning: Value for key '%s' is not a string. Returning null.\n", key)
-			conn.Write([]byte("$-1\r\n"))
+		if !found {
+			conn.Write([]byte(NullResp)) // Return null for non-existent keys
 			return
 		}
 
-		conn.Write([]byte(formatBulkString(strValue)))
+		// Send the value
+		conn.Write([]byte(formatBulkString(string(value))))
 
 	case "CONFIG":
 		if len(args) < 2 || strings.ToLower(args[0]) != "get" {
@@ -527,14 +511,30 @@ func executeCommand(command string, args []string, conn net.Conn, dbWriter JSONW
 		// Respond with a RESP array containing the key and value as bulk strings
 		resp := fmt.Sprintf("*2\r\n%s%s", formatBulkString(key), formatBulkString(value))
 		conn.Write([]byte(resp))
+
 	case "KEYS":
-		content, _ := os.ReadFile(fmt.Sprintf("%s/%s", directory, dbFilename))
+		// Return all keys from the RDB file
+		rdbPath := dbFilename
+		if directory != "" {
+			rdbPath = fmt.Sprintf("%s/%s", directory, dbFilename)
+		}
+
+		// Simple implementation to just return a "*1\r\n" response with the first key found
+		// This would need to be expanded to return all keys in a real implementation
+		rdbData, err := os.ReadFile(rdbPath)
+		if err != nil {
+			sendError(fmt.Errorf("failed to read RDB file: %w", err), conn)
+			return
+		}
+
+		// Simplified version that uses your original code
+		content := rdbData
 		key := parseTable(content)
 		length := key[3]
 		str := key[4 : 4+length]
 		ans := string(str)
 		conn.Write([]byte(fmt.Sprintf("*1\r\n$%v\r\n%s\r\n", len(ans), ans)))
-		return
+
 	default:
 		sendError(errors.New("unknown command '"+command+"'"), conn)
 	}
@@ -548,6 +548,7 @@ func sliceIndex(data []byte, sep byte) int {
 	}
 	return -1
 }
+
 func parseTable(bytes []byte) []byte {
 	start := sliceIndex(bytes, opCodeResizeDB)
 	end := sliceIndex(bytes, opCodeEOF)
