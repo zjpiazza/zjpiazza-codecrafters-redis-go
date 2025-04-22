@@ -693,6 +693,16 @@ func (s *RedisServer) executeCommand(command string, args []string, conn net.Con
 			resp += formatBulkString(key)
 		}
 		conn.Write([]byte(resp))
+	case "INFO":
+		// Get INFO argument
+		// At this stage, we only support "replication" key
+		if len(args) < 1 {
+			s.sendError(errors.New("wrong number of arguments for 'info' command"), conn)
+			return
+		}
+
+		// Hard code response for now
+		conn.Write([]byte(formatBulkString("role:master")))
 
 	default:
 		s.sendError(errors.New("unknown command '"+command+"'"), conn)
