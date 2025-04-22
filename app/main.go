@@ -24,12 +24,27 @@ var _ = os.Exit
 var db = make(map[string]KeystoreEntry)
 var config = make(map[string]string)
 
+const OKResp string = "+OK\r\n"
+const NullResp string = "$-1\r\n"
+const (
+	opCodeModuleAux    byte = 247 /* Module auxiliary data. */
+	opCodeIdle         byte = 248 /* LRU idle time. */
+	opCodeFreq         byte = 249 /* LFU frequency. */
+	opCodeAux          byte = 250 /* RDB aux field. */
+	opCodeResizeDB     byte = 251 /* Hash table resize hint. */
+	opCodeExpireTimeMs byte = 252 /* Expire time in milliseconds. */
+	opCodeExpireTime   byte = 253 /* Old expire time in seconds. */
+	opCodeSelectDB     byte = 254 /* DB number of the following keys. */
+	opCodeEOF          byte = 255
+)
+
+// Read arguments
+var directory string
+var dbFilename string
+
 func main() {
 	fmt.Println("Logs from your program will appear here!")
 
-	// Read arguments
-	var directory string
-	var dbFilename string
 	flag.StringVar(&directory, "dir", "", "Directory for files")                           // directory flag is not used in this updated code
 	flag.StringVar(&dbFilename, "dbfilename", "db.json", "Filename for the database file") // Default to db.json
 	flag.Parse()
@@ -512,8 +527,29 @@ func executeCommand(command string, args []string, conn net.Conn, dbWriter JSONW
 		// Respond with a RESP array containing the key and value as bulk strings
 		resp := fmt.Sprintf("*2\r\n%s%s", formatBulkString(key), formatBulkString(value))
 		conn.Write([]byte(resp))
-
+	case "KEYS":
+		content, _ := os.ReadFile(fmt.Sprintf("%s/%s", directory, dbFilename))
+		key := parseTable(content)
+		length := key[3]
+		str := key[4 : 4+length]
+		ans := string(str)
+		conn.Write([]byte(fmt.Sprintf("*1\r\n$%v\r\n%s\r\n", len(ans), ans)))
+		return
 	default:
 		sendError(errors.New("unknown command '"+command+"'"), conn)
 	}
+}
+
+func sliceIndex(data []byte, sep byte) int {
+	for i, b := range data {
+		if b == sep {
+			return i
+		}
+	}
+	return -1
+}
+func parseTable(bytes []byte) []byte {
+	start := sliceIndex(bytes, opCodeResizeDB)
+	end := sliceIndex(bytes, opCodeEOF)
+	return bytes[start+1 : end]
 }
