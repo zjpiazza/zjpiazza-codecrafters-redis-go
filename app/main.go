@@ -151,6 +151,10 @@ func parseRDBFile(rdbData []byte) {
 	// Skip past the header and version (9 bytes total)
 	pos := 9
 
+	// Variables to track current state
+	var pendingExpiry time.Time
+	var hasPendingExpiry bool
+
 	// Process the RDB file until we reach EOF
 	for pos < len(rdbData) {
 		// Check for EOF marker
@@ -197,19 +201,33 @@ func parseRDBFile(rdbData []byte) {
 			pos += bytesRead
 
 		case opCodeExpireTime:
-			// Skip expiry time in seconds (4 bytes)
+			// Read expiry time in seconds (4 bytes)
+			fmt.Print("Found opCodeExpireTime\n")
 			if pos+4 > len(rdbData) {
 				fmt.Println("Truncated expire time")
 				return
 			}
+
+			// Read the 4-byte expiry time (seconds since epoch)
+			secondsSinceEpoch := int64(binary.LittleEndian.Uint32(rdbData[pos : pos+4]))
+			pendingExpiry = time.Unix(secondsSinceEpoch, 0)
+			hasPendingExpiry = true
+
 			pos += 4
 
 		case opCodeExpireTimeMs:
-			// Skip expiry time in milliseconds (8 bytes)
+			// Read expiry time in milliseconds (8 bytes)
+			fmt.Print("Found opCodeExpireTimeMs\n")
 			if pos+8 > len(rdbData) {
 				fmt.Println("Truncated expire time ms")
 				return
 			}
+
+			// Read the 8-byte expiry time (milliseconds since epoch)
+			millisSinceEpoch := int64(binary.LittleEndian.Uint64(rdbData[pos : pos+8]))
+			pendingExpiry = time.Unix(0, millisSinceEpoch*int64(time.Millisecond))
+			hasPendingExpiry = true
+
 			pos += 8
 
 		case opCodeAux:
@@ -235,10 +253,6 @@ func parseRDBFile(rdbData []byte) {
 
 		case ValueTypeString:
 			// Process actual key-value pair
-			// First, check if there's an expiry time for this key
-			var expires time.Time
-			var hasExpiry bool
-
 			// Read key
 			key, keySize, err := readEncodedString(rdbData, pos)
 			if err != nil {
@@ -259,15 +273,27 @@ func parseRDBFile(rdbData []byte) {
 			}
 			pos += valueSize
 
+			// Check if the pending expiry time has already passed
+			if hasPendingExpiry && time.Now().After(pendingExpiry) {
+				// Key has already expired, don't store it
+				fmt.Printf("Skipping expired key '%s' from RDB file\n", key)
+				// Reset pending expiry
+				hasPendingExpiry = false
+				continue
+			}
+
 			// Store in memory
 			storeMutex.Lock()
 			keyValueStore[key] = value
-			if hasExpiry {
-				expiryTimes[key] = expires
+			if hasPendingExpiry {
+				expiryTimes[key] = pendingExpiry
+				fmt.Printf("Loaded key '%s' with value '%s' and expiration '%s' from RDB file\n", key, value, pendingExpiry)
+				// Reset pending expiry after using it
+				hasPendingExpiry = false
+			} else {
+				fmt.Printf("Loaded key '%s' with value '%s' (no expiration) from RDB file\n", key, value)
 			}
 			storeMutex.Unlock()
-
-			fmt.Printf("Loaded key '%s' with value '%s' from RDB file\n", key, value)
 
 		default:
 			// Skip unknown opcodes
@@ -658,6 +684,10 @@ func getKeyDirect(rdbData []byte, targetKey string) (string, bool) {
 	// Skip past the header and version
 	pos := 9
 
+	// Track pending expiry time
+	var pendingExpiry time.Time
+	var hasPendingExpiry bool
+
 	// Process the RDB file until we reach EOF
 	for pos < len(rdbData) {
 		// Check for EOF marker
@@ -685,11 +715,29 @@ func getKeyDirect(rdbData []byte, targetKey string) (string, bool) {
 			pos += bytesRead
 
 		case opCodeExpireTime:
-			// Skip expiry time in seconds
+			// Read expiry time in seconds
+			if pos+4 > len(rdbData) {
+				return "", false // Malformed file
+			}
+
+			// Read the 4-byte expiry time (seconds since epoch)
+			secondsSinceEpoch := int64(binary.LittleEndian.Uint32(rdbData[pos : pos+4]))
+			pendingExpiry = time.Unix(secondsSinceEpoch, 0)
+			hasPendingExpiry = true
+
 			pos += 4
 
 		case opCodeExpireTimeMs:
-			// Skip expiry time in milliseconds
+			// Read expiry time in milliseconds
+			if pos+8 > len(rdbData) {
+				return "", false // Malformed file
+			}
+
+			// Read the 8-byte expiry time (milliseconds since epoch)
+			millisSinceEpoch := int64(binary.LittleEndian.Uint64(rdbData[pos : pos+8]))
+			pendingExpiry = time.Unix(0, millisSinceEpoch*int64(time.Millisecond))
+			hasPendingExpiry = true
+
 			pos += 8
 
 		case opCodeAux:
@@ -717,18 +765,37 @@ func getKeyDirect(rdbData []byte, targetKey string) (string, bool) {
 			}
 			pos += keySize
 
-			// If this is our target key, read and return the value
+			// If this is our target key
 			if key == targetKey {
+				// First check if the key has expired
+				if hasPendingExpiry && time.Now().After(pendingExpiry) {
+					// Key has expired, don't return it
+					return "", false
+				}
+
+				// Read and return the value
 				value, _, err := readEncodedString(rdbData, pos)
 				if err != nil {
 					return "", false
 				}
+
+				// If key has an expiry time, store it in memory for future access
+				if hasPendingExpiry {
+					storeMutex.Lock()
+					keyValueStore[key] = value
+					expiryTimes[key] = pendingExpiry
+					storeMutex.Unlock()
+				}
+
 				return value, true
 			}
 
 			// Skip value for non-matching keys
 			_, valueSize, _ := readEncodedString(rdbData, pos)
 			pos += valueSize
+
+			// Reset pending expiry after each key
+			hasPendingExpiry = false
 
 		default:
 			// Skip unknown opcodes
