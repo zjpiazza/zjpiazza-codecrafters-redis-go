@@ -54,6 +54,7 @@ type Config struct {
 	Directory  string
 	DBFilename string
 	Port       int
+	Replica    string
 }
 
 // RedisServer represents the Redis server
@@ -702,7 +703,11 @@ func (s *RedisServer) executeCommand(command string, args []string, conn net.Con
 		}
 
 		// Hard code response for now
-		conn.Write([]byte(formatBulkString("role:master")))
+		if s.config.Replica == "" {
+			conn.Write([]byte(formatBulkString("role:master")))
+		} else {
+			conn.Write([]byte(formatBulkString("role:slave")))
+		}
 
 	default:
 		s.sendError(errors.New("unknown command '"+command+"'"), conn)
@@ -964,6 +969,7 @@ func main() {
 	flag.StringVar(&config.Directory, "dir", "", "Directory for files")
 	flag.StringVar(&config.DBFilename, "dbfilename", "dump.rdb", "Filename for the RDB database file")
 	flag.IntVar(&config.Port, "port", 6379, "Application port")
+	flag.StringVar(&config.Replica, "replicaof", "", "Run in replica mode. Address of master node.")
 	flag.Parse()
 
 	// Create the server instance
