@@ -148,51 +148,220 @@ func parseRDBFile(rdbData []byte) {
 		return
 	}
 
-	// Look for the RESIZEDB marker
-	resizeDbPos := bytes.Index(rdbData, []byte{opCodeResizeDB, 0x01, 0x00, 0x00})
-	if resizeDbPos == -1 {
-		fmt.Println("Could not find RESIZEDB marker in RDB file")
-		return
-	}
+	// Skip past the header and version (9 bytes total)
+	pos := 9
 
-	// Move past the RESIZEDB marker and its values
-	startPos := resizeDbPos + 4
-
-	// Read all key-value pairs until EOF
-	for startPos < len(rdbData) && rdbData[startPos] != opCodeEOF {
-		// Read key length (assuming simple format)
-		keyLen := int(rdbData[startPos])
-		startPos++
-
-		if startPos+keyLen > len(rdbData) {
-			fmt.Println("Truncated key in RDB file")
-			return
+	// Process the RDB file until we reach EOF
+	for pos < len(rdbData) {
+		// Check for EOF marker
+		if pos < len(rdbData) && rdbData[pos] == opCodeEOF {
+			fmt.Println("Reached end of RDB file")
+			break
 		}
 
-		// Read key
-		key := string(rdbData[startPos : startPos+keyLen])
-		startPos += keyLen
+		// Process opcodes
+		opcode := rdbData[pos]
+		pos++
 
-		// Read value length
-		valueLen := int(rdbData[startPos])
-		startPos++
+		// fmt.Printf("Processing opcode %d at position %d\n", opcode, pos-1)
 
-		if startPos+valueLen > len(rdbData) {
-			fmt.Println("Truncated value in RDB file")
-			return
+		switch opcode {
+		case opCodeSelectDB:
+			// Database selector
+			if pos < len(rdbData) {
+				currentDB = int(rdbData[pos])
+				pos++
+				fmt.Printf("Switched to DB: %d\n", currentDB)
+			}
+
+		case opCodeResizeDB:
+			// Skip the resize DB info (hash table sizes)
+			// Format: 2 length-encoded integers
+			var bytesRead int
+			_, bytesRead, err := readLength(rdbData, pos)
+			if err != nil {
+				fmt.Printf("Error reading ResizeDB hash table size: %v\n", err)
+				// Try to skip to the next byte
+				pos++
+				continue
+			}
+			pos += bytesRead
+
+			_, bytesRead, err = readLength(rdbData, pos)
+			if err != nil {
+				fmt.Printf("Error reading ResizeDB expire hash table size: %v\n", err)
+				// Try to skip to the next byte
+				pos++
+				continue
+			}
+			pos += bytesRead
+
+		case opCodeExpireTime:
+			// Skip expiry time in seconds (4 bytes)
+			if pos+4 > len(rdbData) {
+				fmt.Println("Truncated expire time")
+				return
+			}
+			pos += 4
+
+		case opCodeExpireTimeMs:
+			// Skip expiry time in milliseconds (8 bytes)
+			if pos+8 > len(rdbData) {
+				fmt.Println("Truncated expire time ms")
+				return
+			}
+			pos += 8
+
+		case opCodeAux:
+			// Handle auxiliary data (key-value pair, both as strings)
+			key, keySize, err := readEncodedString(rdbData, pos)
+			if err != nil {
+				fmt.Printf("Error reading AUX key: %v\n", err)
+				// Just try to move forward
+				pos++
+				continue
+			}
+			pos += keySize
+
+			value, valueSize, err := readEncodedString(rdbData, pos)
+			if err != nil {
+				fmt.Printf("Error reading AUX value: %v\n", err)
+				pos++
+				continue
+			}
+			pos += valueSize
+
+			fmt.Printf("AUX: %s = %s\n", key, value)
+
+		case ValueTypeString:
+			// Process actual key-value pair
+			// First, check if there's an expiry time for this key
+			var expires time.Time
+			var hasExpiry bool
+
+			// Read key
+			key, keySize, err := readEncodedString(rdbData, pos)
+			if err != nil {
+				fmt.Printf("Error reading key: %v\n", err)
+				// Try to skip to next byte
+				pos++
+				continue
+			}
+			pos += keySize
+
+			// Read value
+			value, valueSize, err := readEncodedString(rdbData, pos)
+			if err != nil {
+				fmt.Printf("Error reading value: %v\n", err)
+				// Try to skip
+				pos++
+				continue
+			}
+			pos += valueSize
+
+			// Store in memory
+			storeMutex.Lock()
+			keyValueStore[key] = value
+			if hasExpiry {
+				expiryTimes[key] = expires
+			}
+			storeMutex.Unlock()
+
+			fmt.Printf("Loaded key '%s' with value '%s' from RDB file\n", key, value)
+
+		default:
+			// Skip unknown opcodes
+			fmt.Printf("Unknown opcode: %d at position %d\n", opcode, pos-1)
+			// Move to the next byte and try to continue
+			pos++
+		}
+	}
+}
+
+// readEncodedString reads a Redis encoded string from the RDB file.
+// It handles different string encodings.
+func readEncodedString(data []byte, offset int) (string, int, error) {
+	if offset >= len(data) {
+		return "", 0, io.EOF
+	}
+
+	// Get the first byte to determine the encoding
+	firstByte := data[offset]
+
+	// Check if this is a length-prefixed string or a special encoding
+	switch (firstByte & 0xC0) >> 6 {
+	case 0: // 00 prefix - 6 bit length string
+		length := int(firstByte & 0x3F)
+		offset++
+
+		if offset+length > len(data) {
+			return "", 1, io.ErrUnexpectedEOF
 		}
 
-		// Read value
-		value := string(rdbData[startPos : startPos+valueLen])
-		startPos += valueLen
+		return string(data[offset : offset+length]), length + 1, nil
 
-		// Store in memory
-		storeMutex.Lock()
-		keyValueStore[key] = value
-		storeMutex.Unlock()
+	case 1: // 01 prefix - 14 bit length string
+		if offset+1 >= len(data) {
+			return "", 1, io.ErrUnexpectedEOF
+		}
 
-		fmt.Printf("Loaded key '%s' with value '%s' from RDB file\n", key, value)
+		length := (int(firstByte&0x3F) << 8) | int(data[offset+1])
+		offset += 2
+
+		if offset+length > len(data) {
+			return "", 2, io.ErrUnexpectedEOF
+		}
+
+		return string(data[offset : offset+length]), length + 2, nil
+
+	case 2: // 10 prefix - 32 bit length string
+		if offset+4 >= len(data) {
+			return "", 1, io.ErrUnexpectedEOF
+		}
+
+		length := binary.BigEndian.Uint32(data[offset+1 : offset+5])
+		offset += 5
+
+		if offset+int(length) > len(data) {
+			return "", 5, io.ErrUnexpectedEOF
+		}
+
+		return string(data[offset : offset+int(length)]), int(length) + 5, nil
+
+	case 3: // 11 prefix - Special encoding
+		specialType := firstByte & 0x3F
+
+		switch specialType {
+		case 0: // 8 bit integer
+			if offset+1 >= len(data) {
+				return "", 1, io.ErrUnexpectedEOF
+			}
+
+			value := int(data[offset+1])
+			return strconv.Itoa(value), 2, nil
+
+		case 1: // 16 bit integer
+			if offset+2 >= len(data) {
+				return "", 1, io.ErrUnexpectedEOF
+			}
+
+			value := int(binary.LittleEndian.Uint16(data[offset+1 : offset+3]))
+			return strconv.Itoa(value), 3, nil
+
+		case 2: // 32 bit integer
+			if offset+4 >= len(data) {
+				return "", 1, io.ErrUnexpectedEOF
+			}
+
+			value := int(binary.LittleEndian.Uint32(data[offset+1 : offset+5]))
+			return strconv.Itoa(value), 5, nil
+
+		default:
+			return "", 1, fmt.Errorf("unsupported special encoding format %d", specialType)
+		}
 	}
+
+	return "", 0, fmt.Errorf("invalid string encoding: %x", firstByte)
 }
 
 // Save data to the RDB file
@@ -475,73 +644,83 @@ func readLength(data []byte, offset int) (int, int, error) {
 	return 0, 0, fmt.Errorf("invalid length encoding byte: %x", firstByte)
 }
 
-// New direct approach based on the hexdump patterns
+// Get a key directly from the RDB file
 func getKeyDirect(rdbData []byte, targetKey string) (string, bool) {
-	// Looking at the hexdump pattern, the key-value pair appears to start around offset 0x2c (44)
-	// Specifically, I see in the hexdump:
-	// 1. First there's the REDIS0011 header
-	// 2. Then there's some metadata with "redis-ver" and "redis-bits"
-	// 3. Then at offset 0x2c I see the actual key-value data
-
-	if len(rdbData) < 36 {
+	if len(rdbData) < 9 {
 		return "", false // File too short
 	}
 
-	// Look for the start of the key-value data
-	// The pattern seems to be opCodeResizeDB (0xFB) followed by 01 00 00, then the actual key
-	resizeDbPos := bytes.Index(rdbData, []byte{opCodeResizeDB, 0x01, 0x00, 0x00})
-
-	if resizeDbPos == -1 {
-		fmt.Println("Could not find RESIZEDB marker")
-		return "", false
+	// Check the REDIS header
+	if !bytes.Equal(rdbData[:5], []byte("REDIS")) {
+		return "", false // Invalid header
 	}
 
-	// Move past the RESIZEDB + values (4 bytes total)
-	startPos := resizeDbPos + 4
+	// Skip past the header and version
+	pos := 9
 
-	// Now the format seems to be:
-	// 1. Key length (1 byte for small keys)
-	// 2. Key string
-	// 3. Value length (1 byte for small values)
-	// 4. Value string
-
-	// Safety check
-	if startPos+1 >= len(rdbData) {
-		return "", false
-	}
-
-	// Read key length
-	keyLen := int(rdbData[startPos])
-	startPos++
-
-	// Safety check
-	if startPos+keyLen >= len(rdbData) {
-		return "", false
-	}
-
-	// Read key
-	key := string(rdbData[startPos : startPos+keyLen])
-	startPos += keyLen
-
-	fmt.Printf("Found key in RDB: '%s'\n", key)
-
-	// Check if this is the key we want
-	if key == targetKey {
-		// Read value length
-		valueLen := int(rdbData[startPos])
-		startPos++
-
-		// Safety check
-		if startPos+valueLen > len(rdbData) {
-			return "", false
+	// Process the RDB file until we reach EOF
+	for pos < len(rdbData) {
+		// Check for EOF marker
+		if pos < len(rdbData) && rdbData[pos] == opCodeEOF {
+			break
 		}
 
-		// Read value
-		value := string(rdbData[startPos : startPos+valueLen])
-		return value, true
+		// Process opcodes
+		opcode := rdbData[pos]
+		pos++
+
+		switch opcode {
+		case opCodeSelectDB:
+			// Database selector
+			if pos < len(rdbData) {
+				pos++ // Skip the DB number
+			}
+
+		case opCodeResizeDB:
+			// Skip the resize DB info
+			var bytesRead int
+			_, bytesRead, _ = readLength(rdbData, pos)
+			pos += bytesRead
+			_, bytesRead, _ = readLength(rdbData, pos)
+			pos += bytesRead
+
+		case opCodeExpireTime:
+			// Skip expiry time in seconds
+			pos += 4
+
+		case opCodeExpireTimeMs:
+			// Skip expiry time in milliseconds
+			pos += 8
+
+		case ValueTypeString:
+			// Read key
+			key, keySize, err := readString(rdbData, pos)
+			if err != nil {
+				pos += keySize // Try to continue
+				continue
+			}
+			pos += keySize
+
+			// If this is our target key, read and return the value
+			if key == targetKey {
+				value, _, err := readString(rdbData, pos)
+				if err != nil {
+					return "", false
+				}
+				return value, true
+			}
+
+			// Skip value for non-matching keys
+			_, valueSize, _ := readString(rdbData, pos)
+			pos += valueSize
+
+		default:
+			// Skip unknown opcodes
+			pos++
+		}
 	}
 
-	return "", false
+	return "", false // Key not found
 }
 
 func executeCommand(command string, args []string, conn net.Conn) {
@@ -717,7 +896,7 @@ func executeCommand(command string, args []string, conn net.Conn) {
 		}
 		storeMutex.RUnlock()
 
-		// If no keys yet, try reading from RDB
+		// If no keys in memory, try loading from RDB
 		if len(keys) == 0 {
 			rdbPath := dbFilename
 			if directory != "" {
@@ -730,15 +909,22 @@ func executeCommand(command string, args []string, conn net.Conn) {
 				// Read the RDB file
 				rdbData, err := os.ReadFile(rdbPath)
 				if err == nil {
-					// Simple implementation to get the first key
-					content := rdbData
-					key := parseTable(content)
-					if len(key) > 4 {
-						length := key[3]
-						str := key[4 : 4+length]
-						ans := string(str)
-						keys = append(keys, ans)
+					// Parse RDB file to get keys
+					keysFromRDB := getAllKeysFromRDB(rdbData)
+					keys = append(keys, keysFromRDB...)
+
+					// Store loaded keys in memory for future use
+					storeMutex.Lock()
+					for _, key := range keysFromRDB {
+						if _, exists := keyValueStore[key]; !exists {
+							// Load the value for this key
+							value, found := getKeyDirect(rdbData, key)
+							if found {
+								keyValueStore[key] = value
+							}
+						}
 					}
+					storeMutex.Unlock()
 				}
 			}
 		}
@@ -785,4 +971,79 @@ func min(x, y int) int {
 		return x
 	}
 	return y
+}
+
+// getAllKeysFromRDB extracts all keys from the RDB file
+func getAllKeysFromRDB(rdbData []byte) []string {
+	var keys []string
+
+	if len(rdbData) < 9 {
+		return keys
+	}
+
+	// Check the REDIS header
+	if !bytes.Equal(rdbData[:5], []byte("REDIS")) {
+		return keys
+	}
+
+	// Skip past the header and version
+	pos := 9
+
+	// Process the RDB file until we reach EOF
+	for pos < len(rdbData) {
+		// Check for EOF marker
+		if pos < len(rdbData) && rdbData[pos] == opCodeEOF {
+			break
+		}
+
+		// Process opcodes
+		opcode := rdbData[pos]
+		pos++
+
+		switch opcode {
+		case opCodeSelectDB:
+			// Database selector
+			if pos < len(rdbData) {
+				pos++ // Skip the DB number
+			}
+
+		case opCodeResizeDB:
+			// Skip the resize DB info
+			var bytesRead int
+			_, bytesRead, _ = readLength(rdbData, pos)
+			pos += bytesRead
+			_, bytesRead, _ = readLength(rdbData, pos)
+			pos += bytesRead
+
+		case opCodeExpireTime:
+			// Skip expiry time in seconds
+			pos += 4
+
+		case opCodeExpireTimeMs:
+			// Skip expiry time in milliseconds
+			pos += 8
+
+		case ValueTypeString:
+			// Read key
+			key, keySize, err := readString(rdbData, pos)
+			if err != nil {
+				pos += keySize // Try to continue
+				continue
+			}
+			pos += keySize
+
+			// If this is a key, add it to the list
+			keys = append(keys, key)
+
+			// Skip value for non-matching keys
+			_, valueSize, _ := readString(rdbData, pos)
+			pos += valueSize
+
+		default:
+			// Skip unknown opcodes
+			pos++
+		}
+	}
+
+	return keys
 }
