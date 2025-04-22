@@ -61,12 +61,14 @@ const (
 // Read arguments
 var directory string
 var dbFilename string
+var port int
 
 func main() {
 	fmt.Println("Starting Redis server with RDB file support")
 
 	flag.StringVar(&directory, "dir", "", "Directory for files")
 	flag.StringVar(&dbFilename, "dbfilename", "dump.rdb", "Filename for the RDB database file") // Default to dump.rdb
+	flag.IntVar(&port, "port", 6379, "Application port")
 	flag.Parse()
 
 	// Basic config initialization
@@ -91,9 +93,9 @@ func main() {
 		}
 	}()
 
-	l, err := net.Listen("tcp", "0.0.0.0:6379")
+	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
 	if err != nil {
-		fmt.Println("Failed to bind to port 6379")
+		fmt.Printf("Failed to bind to port %d", port)
 		os.Exit(1)
 	}
 
