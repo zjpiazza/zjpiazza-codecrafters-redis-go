@@ -692,9 +692,25 @@ func getKeyDirect(rdbData []byte, targetKey string) (string, bool) {
 			// Skip expiry time in milliseconds
 			pos += 8
 
+		case opCodeAux:
+			// Skip AUX field
+			_, keySize, err := readEncodedString(rdbData, pos)
+			if err != nil {
+				pos++
+				continue
+			}
+			pos += keySize
+
+			_, valueSize, err := readEncodedString(rdbData, pos)
+			if err != nil {
+				pos++
+				continue
+			}
+			pos += valueSize
+
 		case ValueTypeString:
 			// Read key
-			key, keySize, err := readString(rdbData, pos)
+			key, keySize, err := readEncodedString(rdbData, pos)
 			if err != nil {
 				pos += keySize // Try to continue
 				continue
@@ -703,7 +719,7 @@ func getKeyDirect(rdbData []byte, targetKey string) (string, bool) {
 
 			// If this is our target key, read and return the value
 			if key == targetKey {
-				value, _, err := readString(rdbData, pos)
+				value, _, err := readEncodedString(rdbData, pos)
 				if err != nil {
 					return "", false
 				}
@@ -711,7 +727,7 @@ func getKeyDirect(rdbData []byte, targetKey string) (string, bool) {
 			}
 
 			// Skip value for non-matching keys
-			_, valueSize, _ := readString(rdbData, pos)
+			_, valueSize, _ := readEncodedString(rdbData, pos)
 			pos += valueSize
 
 		default:
@@ -896,8 +912,8 @@ func executeCommand(command string, args []string, conn net.Conn) {
 		}
 		storeMutex.RUnlock()
 
-		// If no keys in memory, try loading from RDB
-		if len(keys) == 0 {
+		// Load any keys from RDB file that aren't already in memory
+		if len(keys) == 0 || true { // Always check RDB file
 			rdbPath := dbFilename
 			if directory != "" {
 				rdbPath = fmt.Sprintf("%s/%s", directory, dbFilename)
@@ -911,20 +927,29 @@ func executeCommand(command string, args []string, conn net.Conn) {
 				if err == nil {
 					// Parse RDB file to get keys
 					keysFromRDB := getAllKeysFromRDB(rdbData)
-					keys = append(keys, keysFromRDB...)
 
-					// Store loaded keys in memory for future use
-					storeMutex.Lock()
-					for _, key := range keysFromRDB {
-						if _, exists := keyValueStore[key]; !exists {
-							// Load the value for this key
-							value, found := getKeyDirect(rdbData, key)
+					// Add keys that aren't already in our list
+					for _, rdbKey := range keysFromRDB {
+						found := false
+						for _, key := range keys {
+							if key == rdbKey {
+								found = true
+								break
+							}
+						}
+
+						if !found {
+							keys = append(keys, rdbKey)
+
+							// Also load the value into memory
+							value, found := getKeyDirect(rdbData, rdbKey)
 							if found {
-								keyValueStore[key] = value
+								storeMutex.Lock()
+								keyValueStore[rdbKey] = value
+								storeMutex.Unlock()
 							}
 						}
 					}
-					storeMutex.Unlock()
 				}
 			}
 		}
@@ -1010,37 +1035,76 @@ func getAllKeysFromRDB(rdbData []byte) []string {
 		case opCodeResizeDB:
 			// Skip the resize DB info
 			var bytesRead int
-			_, bytesRead, _ = readLength(rdbData, pos)
+			_, bytesRead, err := readLength(rdbData, pos)
+			if err != nil {
+				pos++
+				continue
+			}
 			pos += bytesRead
-			_, bytesRead, _ = readLength(rdbData, pos)
+
+			_, bytesRead, err = readLength(rdbData, pos)
+			if err != nil {
+				pos++
+				continue
+			}
 			pos += bytesRead
 
 		case opCodeExpireTime:
 			// Skip expiry time in seconds
-			pos += 4
+			if pos+4 <= len(rdbData) {
+				pos += 4
+			} else {
+				return keys // Malformed file
+			}
 
 		case opCodeExpireTimeMs:
 			// Skip expiry time in milliseconds
-			pos += 8
+			if pos+8 <= len(rdbData) {
+				pos += 8
+			} else {
+				return keys // Malformed file
+			}
 
-		case ValueTypeString:
-			// Read key
-			key, keySize, err := readString(rdbData, pos)
+		case opCodeAux:
+			// Skip AUX field
+			_, keySize, err := readEncodedString(rdbData, pos)
 			if err != nil {
-				pos += keySize // Try to continue
+				pos++
 				continue
 			}
 			pos += keySize
 
-			// If this is a key, add it to the list
-			keys = append(keys, key)
+			_, valueSize, err := readEncodedString(rdbData, pos)
+			if err != nil {
+				pos++
+				continue
+			}
+			pos += valueSize
 
-			// Skip value for non-matching keys
-			_, valueSize, _ := readString(rdbData, pos)
+		case ValueTypeString:
+			// Read key
+			key, keySize, err := readEncodedString(rdbData, pos)
+			if err != nil {
+				pos++
+				continue
+			}
+			pos += keySize
+
+			// Add key to list
+			keys = append(keys, key)
+			fmt.Printf("Found key in RDB: '%s'\n", key)
+
+			// Skip value
+			_, valueSize, err := readEncodedString(rdbData, pos)
+			if err != nil {
+				pos++
+				continue
+			}
 			pos += valueSize
 
 		default:
 			// Skip unknown opcodes
+			fmt.Printf("Unknown opcode: %d at position %d\n", opcode, pos-1)
 			pos++
 		}
 	}
