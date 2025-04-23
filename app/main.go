@@ -714,6 +714,8 @@ func (s *RedisServer) executeCommand(command string, args []string, conn net.Con
 
 		// replication keys
 		conn.Write([]byte(formatBulkString(fmt.Sprintf("role:%s master_replid:%s master_repl_offset:%d", s.config.Role, s.config.ReplicationID, s.config.Offset))))
+	case "REPLCONF":
+		conn.Write([]byte(OKResp))
 
 	default:
 		s.sendError(errors.New("unknown command '"+command+"'"), conn)
