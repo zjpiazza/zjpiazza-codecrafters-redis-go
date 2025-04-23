@@ -60,16 +60,19 @@ type Config struct {
 	MasterAddress string
 	Role          string
 	// Should these be in the Config struct?
-	ReplicationID string
-	Offset        int
+	ReplicationID    string
+	Offset           int
+	ReplicaAddresses []string
 }
 
 // RedisServer represents the Redis server
 type RedisServer struct {
-	config     Config
-	store      *Storage
-	listener   net.Listener
-	saveSignal chan struct{}
+	config             Config
+	store              *Storage
+	listener           net.Listener
+	saveSignal         chan struct{}
+	replicaConnections map[string]net.Conn // Map to store connections to replicas
+	replicasMutex      sync.Mutex          // Mutex to protect access to the connections map
 }
 
 // Storage implements the in-memory key-value store
@@ -190,10 +193,11 @@ func NewRedisServer(config Config) (*RedisServer, error) {
 	}
 
 	return &RedisServer{
-		config:     config,
-		store:      store,
-		listener:   listener,
-		saveSignal: make(chan struct{}, 1),
+		config:             config,
+		store:              store,
+		listener:           listener,
+		saveSignal:         make(chan struct{}, 1),
+		replicaConnections: make(map[string]net.Conn),
 	}, nil
 }
 
@@ -581,6 +585,39 @@ func randSeq(n int) string {
 	return string(b)
 }
 
+func (s *RedisServer) propagateCommand(command []string, address string) error {
+	s.replicasMutex.Lock()
+	conn, exists := s.replicaConnections[address]
+	s.replicasMutex.Unlock()
+
+	if !exists {
+		// If we don't have a connection, try to establish one
+		var err error
+		conn, err = net.Dial("tcp", address)
+		if err != nil {
+			fmt.Println("Error connecting to replica:", err)
+			return err
+		}
+
+		// Store the new connection
+		s.replicasMutex.Lock()
+		s.replicaConnections[address] = conn
+		s.replicasMutex.Unlock()
+	}
+
+	message := formatRESPArray(command)
+	_, err := conn.Write([]byte(message))
+	if err != nil {
+		// Connection might be dead, remove it
+		s.replicasMutex.Lock()
+		delete(s.replicaConnections, address)
+		s.replicasMutex.Unlock()
+		return err
+	}
+
+	return nil
+}
+
 // executeCommand processes a Redis command
 func (s *RedisServer) executeCommand(command string, args []string, conn net.Conn) {
 	log.Printf("Command: %s", command)
@@ -648,6 +685,20 @@ func (s *RedisServer) executeCommand(command string, args []string, conn net.Con
 		s.triggerSave()
 
 		conn.Write([]byte(OKResp))
+
+		// Propagate to replicas
+		if s.config.Role == "master" && len(s.config.ReplicaAddresses) > 0 {
+			fmt.Println("Propagating command to replicas")
+			// Combine command and arguments back together
+			fullCommand := append([]string{"SET"}, args...)
+
+			for _, addr := range s.config.ReplicaAddresses {
+				s.propagateCommand(fullCommand, addr)
+			}
+		} else {
+			fmt.Printf("Role: %s\n", s.config.Role)
+			fmt.Printf("ReplicaAddresses: %v\n", s.config.ReplicaAddresses)
+		}
 
 	case "GET":
 		if len(args) < 1 {
@@ -717,6 +768,18 @@ func (s *RedisServer) executeCommand(command string, args []string, conn net.Con
 		// replication keys
 		conn.Write([]byte(formatBulkString(fmt.Sprintf("role:%s master_replid:%s master_repl_offset:%d", s.config.Role, s.config.ReplicationID, s.config.Offset))))
 	case "REPLCONF":
+		if args[0] == "listening-port" {
+			address := fmt.Sprintf("localhost:%s", args[1])
+			fmt.Printf("Adding replica address: %s\n", address)
+			s.config.ReplicaAddresses = append(s.config.ReplicaAddresses, address)
+
+			// Store the connection that's currently being used
+			s.replicasMutex.Lock()
+			s.replicaConnections[address] = conn
+			s.replicasMutex.Unlock()
+		} else {
+			fmt.Print("No replica address\n")
+		}
 		conn.Write([]byte(OKResp))
 	case "PSYNC":
 		data, err := hex.DecodeString(emptyRDB)
@@ -988,7 +1051,7 @@ func parseArrayHeader(line string) (int, bool) {
 	return count, true
 }
 
-func replicaHandshake(masterAddress string, replicaPort int) bool {
+func replicaHandshake(masterAddress string, replicaPort int) (net.Conn, error) {
 	addressParts := strings.Split(masterAddress, " ")
 
 	// 1. Send PING
@@ -998,10 +1061,8 @@ func replicaHandshake(masterAddress string, replicaPort int) bool {
 	if err != nil {
 		// Do something
 		fmt.Println("Error connecting to host:", err)
-		return false
+		return nil, err
 	}
-
-	defer conn.Close()
 
 	conn.Write([]byte(message))
 
@@ -1009,11 +1070,11 @@ func replicaHandshake(masterAddress string, replicaPort int) bool {
 	response, err := reader.ReadString('\n')
 	if err != nil {
 		fmt.Println("Error reading response:", err)
-		return false
+		return nil, err
 	}
 
 	if response != "+PONG\r\n" {
-		return false
+		return nil, errors.New("Did not received expected response PONG")
 	}
 
 	// 2. Send REPLCONF
@@ -1023,22 +1084,22 @@ func replicaHandshake(masterAddress string, replicaPort int) bool {
 	response, err = reader.ReadString('\n')
 	if err != nil {
 		fmt.Println("Error reading response:", err)
-		return false
+		return nil, err
 	}
 
 	if response != "+OK\r\n" {
-		return false
+		return nil, err
 	}
 	// 2(a). Send 'REPLCONF capa'
 	conn.Write([]byte(formatRESPArray([]string{"REPLCONF", "capa", "psync2"})))
 	response, err = reader.ReadString('\n')
 	if err != nil {
 		fmt.Println("Error reading response:", err)
-		return false
+		return nil, err
 	}
 
 	if response != "+OK\r\n" {
-		return false
+		return nil, err
 	}
 
 	// 3. Send PSYNC
@@ -1047,14 +1108,14 @@ func replicaHandshake(masterAddress string, replicaPort int) bool {
 	response, err = reader.ReadString('\n')
 	if err != nil {
 		fmt.Println("Error reading response:", err)
-		return false
+		return nil, err
 	}
 
 	if !strings.Contains(response, "FULLRESYNC") {
-		return false
+		return nil, err
 	}
 
-	return true
+	return conn, nil
 }
 
 func main() {
@@ -1067,20 +1128,36 @@ func main() {
 	flag.StringVar(&config.MasterAddress, "replicaof", "", "Run in replica mode. Address of master node.")
 	flag.Parse()
 
+	// Set role and initialize replication ID
+	config.ReplicationID = randSeq(40)
+	config.Offset = 0
+
 	if config.MasterAddress == "" {
 		config.Role = "master"
 	} else {
-		fmt.Print("Port ", config.Port)
-		replicaHandshake(config.MasterAddress, config.Port)
 		config.Role = "slave"
 	}
-	config.ReplicationID = randSeq(40)
-	config.Offset = 0
 
 	// Create the server instance
 	server, err := NewRedisServer(config)
 	if err != nil {
 		log.Fatalf("Failed to create server: %v", err)
+	}
+
+	// If we're a replica, establish connection to master
+	if config.Role == "slave" {
+		masterConn, err := replicaHandshake(config.MasterAddress, config.Port)
+		if err != nil {
+			log.Printf("Warning: Failed to establish connection to master: %v", err)
+		} else {
+			// Store the master connection with the address as key
+			parts := strings.Split(config.MasterAddress, " ")
+			masterAddress := fmt.Sprintf("%s:%s", parts[0], parts[1])
+			server.replicasMutex.Lock()
+			server.replicaConnections[masterAddress] = masterConn
+			server.replicasMutex.Unlock()
+			log.Printf("Successfully connected to master at %s", masterAddress)
+		}
 	}
 
 	// Setup context with cancellation for graceful shutdown
