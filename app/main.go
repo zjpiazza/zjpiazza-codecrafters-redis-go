@@ -703,7 +703,7 @@ func (s *RedisServer) executeCommand(command string, args []string, conn net.Con
 			return
 		}
 
-		conn.Write([]byte(generateRESPArray(keys)))
+		conn.Write([]byte(formatRESPArray(keys)))
 	case "INFO":
 		// Get INFO argument
 		// At this stage, we only support "replication" key
@@ -720,7 +720,7 @@ func (s *RedisServer) executeCommand(command string, args []string, conn net.Con
 	}
 }
 
-func generateRESPArray(arr []string) string {
+func formatRESPArray(arr []string) string {
 	resp := fmt.Sprintf("*%d\r\n", len(arr))
 	for _, key := range arr {
 		resp += formatBulkString(key)
@@ -976,6 +976,24 @@ func parseArrayHeader(line string) (int, bool) {
 	return count, true
 }
 
+func replicaHandshake(masterAddress string) {
+	addressParts := strings.Split(masterAddress, " ")
+	// Generate the payload
+	message := formatRESPArray([]string{"PING"})
+
+	// Send message to the master
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%s", addressParts[0], addressParts[1]))
+
+	if err != nil {
+		// Do something
+		fmt.Println("Error occured")
+	}
+
+	defer conn.Close()
+
+	conn.Write([]byte(message))
+}
+
 func main() {
 	// Parse command line flags
 	config := Config{}
@@ -989,6 +1007,7 @@ func main() {
 	if config.MasterAddress == "" {
 		config.Role = "master"
 	} else {
+		replicaHandshake(config.MasterAddress)
 		config.Role = "slave"
 	}
 	config.ReplicationID = randSeq(40)
