@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"os/signal"
@@ -51,10 +52,14 @@ const (
 
 // Config holds server configuration
 type Config struct {
-	Directory  string
-	DBFilename string
-	Port       int
-	Replica    string
+	Directory     string
+	DBFilename    string
+	Port          int
+	MasterAddress string
+	Role          string
+	// Should these be in the Config struct?
+	ReplicationID string
+	Offset        int
 }
 
 // RedisServer represents the Redis server
@@ -564,6 +569,16 @@ func (s *RedisServer) sendError(err error, conn net.Conn) {
 	conn.Write([]byte(errMsg))
 }
 
+var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+func randSeq(n int) string {
+	b := make([]rune, n)
+	for i := range b {
+		b[i] = letters[rand.Intn(len(letters))]
+	}
+	return string(b)
+}
+
 // executeCommand processes a Redis command
 func (s *RedisServer) executeCommand(command string, args []string, conn net.Conn) {
 	log.Printf("Command: %s", command)
@@ -688,12 +703,7 @@ func (s *RedisServer) executeCommand(command string, args []string, conn net.Con
 			return
 		}
 
-		// Format the response as a RESP array
-		resp := fmt.Sprintf("*%d\r\n", len(keys))
-		for _, key := range keys {
-			resp += formatBulkString(key)
-		}
-		conn.Write([]byte(resp))
+		conn.Write([]byte(generateRESPArray(keys)))
 	case "INFO":
 		// Get INFO argument
 		// At this stage, we only support "replication" key
@@ -702,16 +712,20 @@ func (s *RedisServer) executeCommand(command string, args []string, conn net.Con
 			return
 		}
 
-		// Hard code response for now
-		if s.config.Replica == "" {
-			conn.Write([]byte(formatBulkString("role:master")))
-		} else {
-			conn.Write([]byte(formatBulkString("role:slave")))
-		}
+		// replication keys
+		conn.Write([]byte(formatBulkString(fmt.Sprintf("role:%s master_replid:%s master_repl_offset:%d", s.config.Role, s.config.ReplicationID, s.config.Offset))))
 
 	default:
 		s.sendError(errors.New("unknown command '"+command+"'"), conn)
 	}
+}
+
+func generateRESPArray(arr []string) string {
+	resp := fmt.Sprintf("*%d\r\n", len(arr))
+	for _, key := range arr {
+		resp += formatBulkString(key)
+	}
+	return resp
 }
 
 // readEncodedString reads a Redis encoded string from the RDB file.
@@ -969,8 +983,16 @@ func main() {
 	flag.StringVar(&config.Directory, "dir", "", "Directory for files")
 	flag.StringVar(&config.DBFilename, "dbfilename", "dump.rdb", "Filename for the RDB database file")
 	flag.IntVar(&config.Port, "port", 6379, "Application port")
-	flag.StringVar(&config.Replica, "replicaof", "", "Run in replica mode. Address of master node.")
+	flag.StringVar(&config.MasterAddress, "replicaof", "", "Run in replica mode. Address of master node.")
 	flag.Parse()
+
+	if config.MasterAddress == "" {
+		config.Role = "master"
+	} else {
+		config.Role = "slave"
+	}
+	config.ReplicationID = randSeq(40)
+	config.Offset = 0
 
 	// Create the server instance
 	server, err := NewRedisServer(config)
