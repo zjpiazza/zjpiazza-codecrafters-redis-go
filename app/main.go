@@ -976,22 +976,59 @@ func parseArrayHeader(line string) (int, bool) {
 	return count, true
 }
 
-func replicaHandshake(masterAddress string) {
+func replicaHandshake(masterAddress string, replicaPort int) bool {
 	addressParts := strings.Split(masterAddress, " ")
-	// Generate the payload
-	message := formatRESPArray([]string{"PING"})
 
-	// Send message to the master
+	// 1. Send PING and wait for ack
+	message := formatRESPArray([]string{"PING"})
 	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%s", addressParts[0], addressParts[1]))
 
 	if err != nil {
 		// Do something
-		fmt.Println("Error occured")
+		fmt.Println("Error connecting to host:", err)
+		return false
 	}
 
 	defer conn.Close()
 
 	conn.Write([]byte(message))
+
+	reader := bufio.NewReader(conn)
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		fmt.Println("Error reading response:", err)
+		return false
+	}
+
+	if response != "+PONG\r\n" {
+		return false
+	}
+
+	// 2. Send REPLCONF
+	// 2(a). Send 'REPLCONF listening-port' and wait for ack
+	conn.Write([]byte(formatRESPArray([]string{"REPLCONF", "listening-port", strconv.Itoa(replicaPort)})))
+	response, err = reader.ReadString('\n')
+	if err != nil {
+		fmt.Println("Error reading response:", err)
+		return false
+	}
+
+	if response != "+OK\r\n" {
+		return false
+	}
+	// 2(a). Send 'REPLCONF capa' and wait for ack
+	conn.Write([]byte(formatRESPArray([]string{"REPLCONF", "capa", "psync2"})))
+	response, err = reader.ReadString('\n')
+	if err != nil {
+		fmt.Println("Error reading response:", err)
+		return false
+	}
+
+	if response != "+OK\r\n" {
+		return false
+	}
+
+	return true
 }
 
 func main() {
@@ -1007,7 +1044,8 @@ func main() {
 	if config.MasterAddress == "" {
 		config.Role = "master"
 	} else {
-		replicaHandshake(config.MasterAddress)
+		fmt.Print("Port ", config.Port)
+		replicaHandshake(config.MasterAddress, config.Port)
 		config.Role = "slave"
 	}
 	config.ReplicationID = randSeq(40)
