@@ -979,7 +979,7 @@ func parseArrayHeader(line string) (int, bool) {
 func replicaHandshake(masterAddress string, replicaPort int) bool {
 	addressParts := strings.Split(masterAddress, " ")
 
-	// 1. Send PING and wait for ack
+	// 1. Send PING
 	message := formatRESPArray([]string{"PING"})
 	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%s", addressParts[0], addressParts[1]))
 
@@ -1005,7 +1005,8 @@ func replicaHandshake(masterAddress string, replicaPort int) bool {
 	}
 
 	// 2. Send REPLCONF
-	// 2(a). Send 'REPLCONF listening-port' and wait for ack
+
+	// 2(a). Send 'REPLCONF listening-port'
 	conn.Write([]byte(formatRESPArray([]string{"REPLCONF", "listening-port", strconv.Itoa(replicaPort)})))
 	response, err = reader.ReadString('\n')
 	if err != nil {
@@ -1016,7 +1017,7 @@ func replicaHandshake(masterAddress string, replicaPort int) bool {
 	if response != "+OK\r\n" {
 		return false
 	}
-	// 2(a). Send 'REPLCONF capa' and wait for ack
+	// 2(a). Send 'REPLCONF capa'
 	conn.Write([]byte(formatRESPArray([]string{"REPLCONF", "capa", "psync2"})))
 	response, err = reader.ReadString('\n')
 	if err != nil {
@@ -1025,6 +1026,19 @@ func replicaHandshake(masterAddress string, replicaPort int) bool {
 	}
 
 	if response != "+OK\r\n" {
+		return false
+	}
+
+	// 3. Send PSYNC
+	// PSYNC <replicationID> <offset>
+	conn.Write([]byte(formatRESPArray([]string{"PSYNC", "?", "-1"})))
+	response, err = reader.ReadString('\n')
+	if err != nil {
+		fmt.Println("Error reading response:", err)
+		return false
+	}
+
+	if !strings.Contains(response, "FULLRESYNC") {
 		return false
 	}
 
