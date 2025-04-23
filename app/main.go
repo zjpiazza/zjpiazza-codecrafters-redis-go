@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -24,15 +25,16 @@ import (
 
 // RDB file opcodes
 const (
-	opCodeModuleAux    byte = 247 // Module auxiliary data
-	opCodeIdle         byte = 248 // LRU idle time
-	opCodeFreq         byte = 249 // LFU frequency
-	opCodeAux          byte = 250 // RDB aux field
-	opCodeResizeDB     byte = 251 // Hash table resize hint
-	opCodeExpireTimeMs byte = 252 // Expire time in milliseconds
-	opCodeExpireTime   byte = 253 // Old expire time in seconds
-	opCodeSelectDB     byte = 254 // DB number of the following keys
-	opCodeEOF          byte = 255 // End of RDB file indicator
+	opCodeModuleAux    byte   = 247 // Module auxiliary data
+	opCodeIdle         byte   = 248 // LRU idle time
+	opCodeFreq         byte   = 249 // LFU frequency
+	opCodeAux          byte   = 250 // RDB aux field
+	opCodeResizeDB     byte   = 251 // Hash table resize hint
+	opCodeExpireTimeMs byte   = 252 // Expire time in milliseconds
+	opCodeExpireTime   byte   = 253 // Old expire time in seconds
+	opCodeSelectDB     byte   = 254 // DB number of the following keys
+	opCodeEOF          byte   = 255 // End of RDB file indicator
+	emptyRDB           string = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2"
 )
 
 // Value type opcodes
@@ -717,7 +719,14 @@ func (s *RedisServer) executeCommand(command string, args []string, conn net.Con
 	case "REPLCONF":
 		conn.Write([]byte(OKResp))
 	case "PSYNC":
+		data, err := hex.DecodeString(emptyRDB)
+		if err != nil {
+			log.Fatalf("Failed to decode hex string: %v", err)
+		}
+
 		conn.Write([]byte(fmt.Sprintf("+FULLRESYNC %s %d\r\n", s.config.ReplicationID, s.config.Offset)))
+		conn.Write([]byte(fmt.Sprintf("$%d\r\n%s", len(data), data)))
+
 	default:
 		s.sendError(errors.New("unknown command '"+command+"'"), conn)
 	}
