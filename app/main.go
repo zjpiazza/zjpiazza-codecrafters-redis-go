@@ -59,10 +59,9 @@ type Config struct {
 	Port          int
 	MasterAddress string
 	Role          string
-	// Should these be in the Config struct?
-	ReplicationID    string
-	Offset           int
-	ReplicaAddresses []string
+	// Replication metadata
+	ReplicationID string
+	Offset        int
 }
 
 // RedisServer represents the Redis server
@@ -192,13 +191,18 @@ func NewRedisServer(config Config) (*RedisServer, error) {
 		return nil, fmt.Errorf("failed to bind to port %d: %w", config.Port, err)
 	}
 
-	return &RedisServer{
+	server := &RedisServer{
 		config:             config,
 		store:              store,
 		listener:           listener,
 		saveSignal:         make(chan struct{}, 1),
 		replicaConnections: make(map[string]net.Conn),
-	}, nil
+	}
+
+	// Set the global server instance
+	setServerInstance(server)
+
+	return server, nil
 }
 
 // Start begins the Redis server operation
@@ -586,28 +590,39 @@ func randSeq(n int) string {
 }
 
 func (s *RedisServer) propagateCommand(command []string, address string) error {
+	fmt.Printf("DEBUG: propagateCommand called for address: %s with command: %v\n", address, command)
+
 	s.replicasMutex.Lock()
 	conn, exists := s.replicaConnections[address]
 	s.replicasMutex.Unlock()
 
 	if !exists {
+		fmt.Printf("DEBUG: No existing connection for %s, attempting to establish one\n", address)
 		// If we don't have a connection, try to establish one
 		var err error
 		conn, err = net.Dial("tcp", address)
 		if err != nil {
-			fmt.Println("Error connecting to replica:", err)
+			fmt.Printf("ERROR: Failed to connect to replica at %s: %v\n", address, err)
 			return err
 		}
+		fmt.Printf("DEBUG: New connection established to %s\n", address)
 
 		// Store the new connection
 		s.replicasMutex.Lock()
 		s.replicaConnections[address] = conn
 		s.replicasMutex.Unlock()
+	} else {
+		fmt.Printf("DEBUG: Using existing connection for %s\n", address)
 	}
 
+	// Format the command as a RESP array
 	message := formatRESPArray(command)
+	fmt.Printf("DEBUG: Sending message to replica: %q\n", message)
+
+	// Write the command to the replica
 	_, err := conn.Write([]byte(message))
 	if err != nil {
+		fmt.Printf("ERROR: Failed to write to replica at %s: %v\n", address, err)
 		// Connection might be dead, remove it
 		s.replicasMutex.Lock()
 		delete(s.replicaConnections, address)
@@ -615,12 +630,29 @@ func (s *RedisServer) propagateCommand(command []string, address string) error {
 		return err
 	}
 
+	// Read the response
+	reader := bufio.NewReader(conn)
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			fmt.Printf("ERROR: Connection to replica at %s closed\n", address)
+		} else {
+			fmt.Printf("ERROR: Failed to read response from replica at %s: %v\n", address, err)
+		}
+		// Connection might be dead, remove it
+		s.replicasMutex.Lock()
+		delete(s.replicaConnections, address)
+		s.replicasMutex.Unlock()
+		return err
+	}
+
+	fmt.Printf("DEBUG: Received response from replica at %s: %q\n", address, response)
 	return nil
 }
 
-// executeCommand processes a Redis command
-func (s *RedisServer) executeCommand(command string, args []string, conn net.Conn) {
-	log.Printf("Command: %s", command)
+// executeRedisCommand is a shared function that executes Redis commands regardless of source
+func (s *RedisServer) executeRedisCommand(command string, args []string, conn net.Conn, shouldPropagate bool) {
+	log.Printf("Executing command: %s, propagation: %v", command, shouldPropagate)
 
 	switch command {
 	case "PING":
@@ -684,20 +716,28 @@ func (s *RedisServer) executeCommand(command string, args []string, conn net.Con
 		// Trigger a save
 		s.triggerSave()
 
-		conn.Write([]byte(OKResp))
+		if conn != nil {
+			conn.Write([]byte(OKResp))
+		}
 
-		// Propagate to replicas
-		if s.config.Role == "master" && len(s.config.ReplicaAddresses) > 0 {
-			fmt.Println("Propagating command to replicas")
-			// Combine command and arguments back together
-			fullCommand := append([]string{"SET"}, args...)
+		// Propagate to replicas if needed
+		if shouldPropagate && s.config.Role == "master" {
+			s.replicasMutex.Lock()
+			replicaCount := len(s.replicaConnections)
+			s.replicasMutex.Unlock()
 
-			for _, addr := range s.config.ReplicaAddresses {
-				s.propagateCommand(fullCommand, addr)
+			if replicaCount > 0 {
+				fmt.Println("DEBUG: Propagating SET command to replicas")
+				// Combine command and arguments back together
+				fullCommand := append([]string{"SET"}, args...)
+
+				// Iterate over all replica connections
+				s.replicasMutex.Lock()
+				for address := range s.replicaConnections {
+					go s.propagateCommand(fullCommand, address)
+				}
+				s.replicasMutex.Unlock()
 			}
-		} else {
-			fmt.Printf("Role: %s\n", s.config.Role)
-			fmt.Printf("ReplicaAddresses: %v\n", s.config.ReplicaAddresses)
 		}
 
 	case "GET":
@@ -715,6 +755,46 @@ func (s *RedisServer) executeCommand(command string, args []string, conn net.Con
 		}
 
 		conn.Write([]byte(formatBulkString(value)))
+
+	case "DEL":
+		if len(args) < 1 {
+			s.sendError(errors.New("wrong number of arguments for 'del' command"), conn)
+			return
+		}
+
+		count := 0
+		for _, key := range args {
+			if _, exists := s.store.Get(key); exists {
+				s.store.Delete(key)
+				count++
+			}
+		}
+
+		// Trigger a save
+		s.triggerSave()
+
+		// Send response
+		if conn != nil {
+			conn.Write([]byte(fmt.Sprintf(":%d\r\n", count)))
+		}
+
+		// Propagate to replicas if needed
+		if shouldPropagate && s.config.Role == "master" {
+			s.replicasMutex.Lock()
+			replicaCount := len(s.replicaConnections)
+			s.replicasMutex.Unlock()
+
+			if replicaCount > 0 {
+				fmt.Println("DEBUG: Propagating DEL command to replicas")
+				fullCommand := append([]string{"DEL"}, args...)
+
+				s.replicasMutex.Lock()
+				for address := range s.replicaConnections {
+					go s.propagateCommand(fullCommand, address)
+				}
+				s.replicasMutex.Unlock()
+			}
+		}
 
 	case "CONFIG":
 		if len(args) < 2 || strings.ToLower(args[0]) != "get" {
@@ -757,6 +837,7 @@ func (s *RedisServer) executeCommand(command string, args []string, conn net.Con
 		}
 
 		conn.Write([]byte(formatRESPArray(keys)))
+
 	case "INFO":
 		// Get INFO argument
 		// At this stage, we only support "replication" key
@@ -767,20 +848,26 @@ func (s *RedisServer) executeCommand(command string, args []string, conn net.Con
 
 		// replication keys
 		conn.Write([]byte(formatBulkString(fmt.Sprintf("role:%s master_replid:%s master_repl_offset:%d", s.config.Role, s.config.ReplicationID, s.config.Offset))))
-	case "REPLCONF":
-		if args[0] == "listening-port" {
-			address := fmt.Sprintf("localhost:%s", args[1])
-			fmt.Printf("Adding replica address: %s\n", address)
-			s.config.ReplicaAddresses = append(s.config.ReplicaAddresses, address)
 
+	case "REPLCONF":
+		if len(args) < 2 {
+			s.sendError(errors.New("wrong number of arguments for 'replconf' command"), conn)
+			return
+		}
+
+		if args[0] == "listening-port" {
 			// Store the connection that's currently being used
+			address := fmt.Sprintf("localhost:%s", args[1])
+			fmt.Printf("DEBUG: Registering replica at address: %s\n", address)
 			s.replicasMutex.Lock()
 			s.replicaConnections[address] = conn
+			fmt.Printf("DEBUG: After registration, replica count: %d\n", len(s.replicaConnections))
 			s.replicasMutex.Unlock()
 		} else {
-			fmt.Print("No replica address\n")
+			fmt.Printf("DEBUG: REPLCONF with argument: %s (not listening-port)\n", args[0])
 		}
 		conn.Write([]byte(OKResp))
+
 	case "PSYNC":
 		data, err := hex.DecodeString(emptyRDB)
 		if err != nil {
@@ -790,8 +877,200 @@ func (s *RedisServer) executeCommand(command string, args []string, conn net.Con
 		conn.Write([]byte(fmt.Sprintf("+FULLRESYNC %s %d\r\n", s.config.ReplicationID, s.config.Offset)))
 		conn.Write([]byte(fmt.Sprintf("$%d\r\n%s", len(data), data)))
 
+	case "SELECT":
+		// In our implementation, we ignore SELECT commands since we only support a single database
+		if conn != nil {
+			conn.Write([]byte(OKResp))
+		}
+
 	default:
-		s.sendError(errors.New("unknown command '"+command+"'"), conn)
+		if conn != nil {
+			s.sendError(errors.New("unknown command '"+command+"'"), conn)
+		} else {
+			fmt.Printf("DEBUG: Ignoring unknown command: %s from master\n", command)
+		}
+	}
+}
+
+// executeCommand processes a Redis command from a client
+func (s *RedisServer) executeCommand(command string, args []string, conn net.Conn) {
+	// Call the shared execute function with propagation enabled
+	s.executeRedisCommand(command, args, conn, true)
+}
+
+// processMasterCommands continuously reads and processes commands from the master
+func processMasterCommands(conn net.Conn) {
+	reader := bufio.NewReader(conn)
+
+	for {
+		// First message after PSYNC will be the RDB file, we need to read and process it
+		bulkStringHeader, err := reader.ReadString('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				fmt.Println("Master connection closed")
+				return
+			}
+			fmt.Printf("Error reading from master: %v\n", err)
+			return
+		}
+
+		// If it's an RDB file transfer (starts with $)
+		if strings.HasPrefix(bulkStringHeader, "$") {
+			fmt.Println("DEBUG: Received RDB file header from master")
+
+			// Skip RDB file processing for now
+			bulkStringHeaderPattern := regexp.MustCompile(`^\$(\d+)\r\n$`)
+			matches := bulkStringHeaderPattern.FindStringSubmatch(bulkStringHeader)
+			if len(matches) < 2 {
+				fmt.Println("Invalid RDB header format")
+				continue
+			}
+
+			count, err := strconv.Atoi(matches[1])
+			if err != nil || count < 0 {
+				fmt.Println("Invalid RDB length")
+				continue
+			}
+
+			// Read and discard the RDB data
+			rdbData := make([]byte, count+2) // +2 for \r\n
+			_, err = io.ReadFull(reader, rdbData)
+			if err != nil {
+				fmt.Printf("Error reading RDB data: %v\n", err)
+				return
+			}
+
+			fmt.Printf("DEBUG: Successfully read %d bytes of RDB data\n", count)
+			continue
+		}
+
+		// Regular command processing for replication
+		if strings.HasPrefix(bulkStringHeader, "*") {
+			fmt.Println("DEBUG: Received command from master")
+
+			// Parse array header to get number of elements
+			count, valid := parseArrayHeader(bulkStringHeader)
+			if !valid {
+				fmt.Println("Invalid array header from master")
+				continue
+			}
+
+			// Read all elements (command + args)
+			var command string
+			var arguments []string
+
+			for i := 0; i < count; i++ {
+				element, err := parseBulkString(reader)
+				if err != nil {
+					fmt.Printf("Error parsing element: %v\n", err)
+					break
+				}
+
+				if i == 0 {
+					command = strings.ToUpper(element)
+				} else {
+					arguments = append(arguments, element)
+				}
+			}
+
+			// Get server instance
+			server := getServerInstance()
+			if server == nil {
+				fmt.Println("ERROR: Could not access server instance")
+				continue
+			}
+
+			// Execute the command without propagation (since it's from master)
+			server.executeRedisCommand(command, arguments, nil, false)
+		}
+	}
+}
+
+// Global server instance for access from command processing
+var globalServer *RedisServer
+var serverMutex sync.Mutex
+
+// setServerInstance safely sets the global server instance
+func setServerInstance(server *RedisServer) {
+	serverMutex.Lock()
+	defer serverMutex.Unlock()
+	globalServer = server
+}
+
+// getServerInstance safely retrieves the global server instance
+func getServerInstance() *RedisServer {
+	serverMutex.Lock()
+	defer serverMutex.Unlock()
+	return globalServer
+}
+
+func main() {
+	// Parse command line flags
+	config := Config{}
+
+	flag.StringVar(&config.Directory, "dir", "", "Directory for files")
+	flag.StringVar(&config.DBFilename, "dbfilename", "dump.rdb", "Filename for the RDB database file")
+	flag.IntVar(&config.Port, "port", 6379, "Application port")
+	flag.StringVar(&config.MasterAddress, "replicaof", "", "Run in replica mode. Address of master node.")
+	flag.Parse()
+
+	// Set role and initialize replication ID
+	config.ReplicationID = randSeq(40)
+	config.Offset = 0
+
+	if config.MasterAddress == "" {
+		config.Role = "master"
+	} else {
+		config.Role = "slave"
+	}
+
+	// Create the server instance
+	server, err := NewRedisServer(config)
+	if err != nil {
+		log.Fatalf("Failed to create server: %v", err)
+	}
+
+	// If we're a replica, establish connection to master
+	if config.Role == "slave" {
+		fmt.Printf("DEBUG: Running as replica, connecting to master at %s\n", config.MasterAddress)
+
+		masterConn, err := replicaHandshake(config.MasterAddress, config.Port)
+		if err != nil {
+			log.Printf("Warning: Failed to establish connection to master: %v", err)
+		} else {
+			// Store the master connection with the address as key
+			parts := strings.Split(config.MasterAddress, " ")
+			masterAddress := fmt.Sprintf("%s:%s", parts[0], parts[1])
+
+			fmt.Printf("DEBUG: Storing master connection with key: %s\n", masterAddress)
+			server.replicasMutex.Lock()
+			server.replicaConnections[masterAddress] = masterConn
+			fmt.Printf("DEBUG: Connection map now has %d entries\n", len(server.replicaConnections))
+			server.replicasMutex.Unlock()
+
+			log.Printf("Successfully connected to master at %s", masterAddress)
+		}
+	} else {
+		fmt.Println("DEBUG: Running as master, waiting for replica connections")
+	}
+
+	// Setup context with cancellation for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle signals for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigChan
+		log.Printf("Received signal %v, shutting down...", sig)
+		cancel()
+	}()
+
+	// Start the server
+	if err := server.Start(ctx); err != nil {
+		log.Fatalf("Server error: %v", err)
 	}
 }
 
@@ -801,6 +1080,106 @@ func formatRESPArray(arr []string) string {
 		resp += formatBulkString(key)
 	}
 	return resp
+}
+
+// formatBulkString formats a string as a RESP bulk string
+func formatBulkString(text string) string {
+	if text == "" {
+		return NullResp
+	}
+	return fmt.Sprintf("$%d\r\n%s\r\n", len(text), text)
+}
+
+// parseCommand parses a RESP protocol command
+func parseCommand(reader *bufio.Reader) (string, []string, error) {
+	arrayHeader, err := reader.ReadString('\n')
+	if err != nil {
+		return "", nil, err
+	}
+
+	count, valid := parseArrayHeader(arrayHeader)
+	if !valid {
+		return "", nil, errors.New("invalid array header")
+	}
+
+	if count <= 0 {
+		return "", nil, errors.New("empty or invalid command")
+	}
+
+	// Read all elements (command + args)
+	var command string
+	var arguments []string
+
+	for i := 0; i < count; i++ {
+		element, err := parseBulkString(reader)
+		if err != nil {
+			return "", nil, err
+		}
+
+		if i == 0 {
+			command = strings.ToUpper(element) // Commands are case-insensitive
+		} else {
+			arguments = append(arguments, element)
+		}
+	}
+
+	return command, arguments, nil
+}
+
+// parseBulkString parses a RESP protocol bulk string
+func parseBulkString(reader *bufio.Reader) (string, error) {
+	bulkStringHeader, err := reader.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+
+	// Check for null bulk string
+	if bulkStringHeader == "$-1\r\n" {
+		return "", nil
+	}
+
+	// Parse length
+	bulkStringHeaderPattern := regexp.MustCompile(`^\$(\d+)\r\n$`)
+	matches := bulkStringHeaderPattern.FindStringSubmatch(bulkStringHeader)
+	if len(matches) < 2 {
+		return "", errors.New("invalid bulk string header format")
+	}
+
+	count, err := strconv.Atoi(matches[1])
+	if err != nil || count < 0 {
+		return "", errors.New("invalid bulk string length")
+	}
+
+	// Read exactly count bytes plus \r\n
+	bulkString := make([]byte, count+2) // +2 for \r\n
+	_, err = io.ReadFull(reader, bulkString)
+	if err != nil {
+		return "", err
+	}
+
+	// Verify the last two bytes are \r\n
+	if !bytes.Equal(bulkString[count:], []byte("\r\n")) {
+		return "", errors.New("bulk string missing terminator")
+	}
+
+	return string(bulkString[:count]), nil
+}
+
+// parseArrayHeader parses a RESP protocol array header
+func parseArrayHeader(line string) (int, bool) {
+	pattern := regexp.MustCompile(`^\*(\d+)\r\n$`)
+	matches := pattern.FindStringSubmatch(line)
+
+	if len(matches) < 2 {
+		return 0, false
+	}
+
+	count, err := strconv.Atoi(matches[1])
+	if err != nil {
+		return 0, false
+	}
+
+	return count, true
 }
 
 // readEncodedString reads a Redis encoded string from the RDB file.
@@ -949,120 +1328,19 @@ func readLength(data []byte, offset int) (int, int, error) {
 	return 0, 0, fmt.Errorf("invalid length encoding byte: %x", firstByte)
 }
 
-// RESP protocol parsing functions
-
-// parseCommand parses a RESP protocol command
-func parseCommand(reader *bufio.Reader) (string, []string, error) {
-	arrayHeader, err := reader.ReadString('\n')
-	if err != nil {
-		return "", nil, err
-	}
-
-	count, valid := parseArrayHeader(arrayHeader)
-	if !valid {
-		return "", nil, errors.New("invalid array header")
-	}
-
-	if count <= 0 {
-		return "", nil, errors.New("empty or invalid command")
-	}
-
-	// Read all elements (command + args)
-	var command string
-	var arguments []string
-
-	for i := 0; i < count; i++ {
-		element, err := parseBulkString(reader)
-		if err != nil {
-			return "", nil, err
-		}
-
-		if i == 0 {
-			command = strings.ToUpper(element) // Commands are case-insensitive
-		} else {
-			arguments = append(arguments, element)
-		}
-	}
-
-	return command, arguments, nil
-}
-
-// formatBulkString formats a string as a RESP bulk string
-func formatBulkString(text string) string {
-	if text == "" {
-		return NullResp
-	}
-	return fmt.Sprintf("$%d\r\n%s\r\n", len(text), text)
-}
-
-// parseBulkString parses a RESP protocol bulk string
-func parseBulkString(reader *bufio.Reader) (string, error) {
-	bulkStringHeader, err := reader.ReadString('\n')
-	if err != nil {
-		return "", err
-	}
-
-	// Check for null bulk string
-	if bulkStringHeader == "$-1\r\n" {
-		return "", nil
-	}
-
-	// Parse length
-	bulkStringHeaderPattern := regexp.MustCompile(`^\$(\d+)\r\n$`)
-	matches := bulkStringHeaderPattern.FindStringSubmatch(bulkStringHeader)
-	if len(matches) < 2 {
-		return "", errors.New("invalid bulk string header format")
-	}
-
-	count, err := strconv.Atoi(matches[1])
-	if err != nil || count < 0 {
-		return "", errors.New("invalid bulk string length")
-	}
-
-	// Read exactly count bytes plus \r\n
-	bulkString := make([]byte, count+2) // +2 for \r\n
-	_, err = io.ReadFull(reader, bulkString)
-	if err != nil {
-		return "", err
-	}
-
-	// Verify the last two bytes are \r\n
-	if !bytes.Equal(bulkString[count:], []byte("\r\n")) {
-		return "", errors.New("bulk string missing terminator")
-	}
-
-	return string(bulkString[:count]), nil
-}
-
-// parseArrayHeader parses a RESP protocol array header
-func parseArrayHeader(line string) (int, bool) {
-	pattern := regexp.MustCompile(`^\*(\d+)\r\n$`)
-	matches := pattern.FindStringSubmatch(line)
-
-	if len(matches) < 2 {
-		return 0, false
-	}
-
-	count, err := strconv.Atoi(matches[1])
-	if err != nil {
-		return 0, false
-	}
-
-	return count, true
-}
-
 func replicaHandshake(masterAddress string, replicaPort int) (net.Conn, error) {
 	addressParts := strings.Split(masterAddress, " ")
+	fmt.Printf("DEBUG: Initiating handshake with master at %s:%s\n", addressParts[0], addressParts[1])
 
 	// 1. Send PING
 	message := formatRESPArray([]string{"PING"})
 	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%s", addressParts[0], addressParts[1]))
 
 	if err != nil {
-		// Do something
 		fmt.Println("Error connecting to host:", err)
 		return nil, err
 	}
+	fmt.Println("DEBUG: Successfully connected to master")
 
 	conn.Write([]byte(message))
 
@@ -1115,67 +1393,8 @@ func replicaHandshake(masterAddress string, replicaPort int) (net.Conn, error) {
 		return nil, err
 	}
 
+	// Start a goroutine to process commands from the master
+	go processMasterCommands(conn)
+
 	return conn, nil
-}
-
-func main() {
-	// Parse command line flags
-	config := Config{}
-
-	flag.StringVar(&config.Directory, "dir", "", "Directory for files")
-	flag.StringVar(&config.DBFilename, "dbfilename", "dump.rdb", "Filename for the RDB database file")
-	flag.IntVar(&config.Port, "port", 6379, "Application port")
-	flag.StringVar(&config.MasterAddress, "replicaof", "", "Run in replica mode. Address of master node.")
-	flag.Parse()
-
-	// Set role and initialize replication ID
-	config.ReplicationID = randSeq(40)
-	config.Offset = 0
-
-	if config.MasterAddress == "" {
-		config.Role = "master"
-	} else {
-		config.Role = "slave"
-	}
-
-	// Create the server instance
-	server, err := NewRedisServer(config)
-	if err != nil {
-		log.Fatalf("Failed to create server: %v", err)
-	}
-
-	// If we're a replica, establish connection to master
-	if config.Role == "slave" {
-		masterConn, err := replicaHandshake(config.MasterAddress, config.Port)
-		if err != nil {
-			log.Printf("Warning: Failed to establish connection to master: %v", err)
-		} else {
-			// Store the master connection with the address as key
-			parts := strings.Split(config.MasterAddress, " ")
-			masterAddress := fmt.Sprintf("%s:%s", parts[0], parts[1])
-			server.replicasMutex.Lock()
-			server.replicaConnections[masterAddress] = masterConn
-			server.replicasMutex.Unlock()
-			log.Printf("Successfully connected to master at %s", masterAddress)
-		}
-	}
-
-	// Setup context with cancellation for graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Handle signals for graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		sig := <-sigChan
-		log.Printf("Received signal %v, shutting down...", sig)
-		cancel()
-	}()
-
-	// Start the server
-	if err := server.Start(ctx); err != nil {
-		log.Fatalf("Server error: %v", err)
-	}
 }
